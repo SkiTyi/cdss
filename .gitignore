@@ -1,0 +1,62 @@
+# ── Python ──────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+venv/
+.venv/
+env/
+
+# ── Node ────────────────────────────────────────────────────────────────
+node_modules/
+dist/
+.vite/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ── 项目数据与运行产物 ──────────────────────────────────────────────────
+# SQLite 数据库（每台机器自行迁移；过大不适合入仓库）
+backend/cdss.db
+backend/cdss.db-journal
+backend/cdss.db-wal
+backend/cdss.db-shm
+
+# 训练 / 预训练运行目录（含 checkpoint 和 metrics）
+backend/training_runs/
+backend/pretrain_runs/
+backend/vllm_logs/
+
+# 原始数据目录（体量巨大且涉及版权，跨机器请 rsync 单独同步）
+crawler/
+guideline/
+
+# ── 凭据与本地配置 ──────────────────────────────────────────────────────
+backend/.env
+.env.local
+.env.*.local
+
+# ── 编辑器 / IDE ────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# ── Claude Code 私有工作区 ──────────────────────────────────────────────
+# CLAUDE.md 是项目级协作约定，应该入仓库
+# .claude/ 是会话级本地状态（计划、worktree 等），不入仓库
+.claude/
+
+# ── 杂项 ────────────────────────────────────────────────────────────────
+*.deb
+*.tar.gz
+*.zip
+link*.sh
+serve_model_*.sh

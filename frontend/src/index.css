@@ -1,0 +1,8 @@
+@import "tailwindcss";
+
+/* 增加一个基础背景色防止变黑 */
+body {
+  background-color: #f8fafc;
+  margin: 0;
+  padding: 0;
+}
