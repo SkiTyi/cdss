@@ -184,14 +184,23 @@ class VLLMManager:
         #          [n]=single, [n,m,...]=multi (auto-add tensor-parallel)
         gpu_ids = assistant.gpu_ids
         env = build_subprocess_env({"PYTHONUNBUFFERED": "1"})
+        is_multi_gpu = isinstance(gpu_ids, list) and len(gpu_ids) > 1
         if isinstance(gpu_ids, list) and gpu_ids:
             env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
             # Auto-inject --tensor-parallel-size for multi-GPU unless the user
             # already specified it themselves in extra_vllm_args.
-            if len(gpu_ids) > 1 and not _has_flag(
+            if is_multi_gpu and not _has_flag(
                     assistant.extra_vllm_args or [],
                     "--tensor-parallel-size", "-tp"):
                 cmd += ["--tensor-parallel-size", str(len(gpu_ids))]
+
+        # Multi-GPU vllm spawns one worker per GPU via Python multiprocessing.
+        # vllm's default `fork` start method deadlocks when the parent has
+        # any CUDA state — symptom: log stops at "Started engine process"
+        # and never produces another line until our 600s monitor times out.
+        # Forcing `spawn` is the canonical fix (vllm docs + GH issues).
+        if is_multi_gpu:
+            env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
         # ── max-model-len (still a first-class field on the form) ─────────
         if assistant.max_model_len and not _has_flag(
@@ -242,11 +251,15 @@ class VLLMManager:
         })
 
         # Background thread: poll /v1/models until healthy, or until the
-        # process dies, then update DB status accordingly.
+        # process dies, then update DB status accordingly. Multi-GPU startup
+        # is slower (per-GPU CUDA graph capture + NCCL handshake), so we
+        # scale the wait budget by GPU count.
+        n_gpus = len(gpu_ids) if isinstance(gpu_ids, list) and gpu_ids else 1
+        max_wait = 600 + 300 * max(0, n_gpus - 1)   # +5min per extra GPU
         t = threading.Thread(
             target=self._monitor_until_ready,
             args=(assistant.id, port, served_name,
-                  proc, log_path, db_factory),
+                  proc, log_path, db_factory, max_wait),
             daemon=True,
         )
         t.start()
