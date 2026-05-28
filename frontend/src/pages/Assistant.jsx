@@ -20,6 +20,9 @@ function AssistantFormModal({ initial, experiments, onClose, onSaved }) {
   const [form, setForm] = useState(initial ? {
     ...initial,
     extra_vllm_args: Array.isArray(initial.extra_vllm_args) ? initial.extra_vllm_args.join(' ') : '',
+    extra_env_vars: initial.extra_env_vars && Object.keys(initial.extra_env_vars).length
+      ? Object.entries(initial.extra_env_vars).map(([k, v]) => `${k}=${v}`).join('\n')
+      : '',
     api_key: '',  // never pre-fill secrets
   } : {
     name: '',
@@ -31,6 +34,7 @@ function AssistantFormModal({ initial, experiments, onClose, onSaved }) {
     model_path: '',
     max_model_len: 16384,
     extra_vllm_args: '',
+    extra_env_vars: '',
     lora_adapter_path: '',
     source_experiment_id: '',
     gpu_ids: null,
@@ -135,6 +139,16 @@ function AssistantFormModal({ initial, experiments, onClose, onSaved }) {
         } else {
           payload.extra_vllm_args = []
         }
+        // Parse extra_env_vars textarea: one KEY=VALUE per line; comments / blanks ignored.
+        const envObj = {}
+        for (const raw of (form.extra_env_vars || '').split('\n')) {
+          const line = raw.trim()
+          if (!line || line.startsWith('#')) continue
+          const eq = line.indexOf('=')
+          if (eq <= 0) continue
+          envObj[line.slice(0, eq).trim()] = line.slice(eq + 1).trim()
+        }
+        payload.extra_env_vars = envObj
         if (form.source_experiment_id) payload.source_experiment_id = Number(form.source_experiment_id)
         // Always send gpu_ids; null means auto. Use [] sentinel only for the
         // narrow CPU case (vllm doesn't support CPU well, so we never send []).
@@ -377,6 +391,20 @@ function AssistantFormModal({ initial, experiments, onClose, onSaved }) {
                   placeholder="例：--gpu-memory-utilization 0.85 --dtype bfloat16 --disable-log-requests" />
                 <p className="text-[11px] text-slate-400 mt-1">
                   后端只附加 model / served-model-name / host / port / max-model-len / LoRA / tensor-parallel-size，其他参数完全由你掌控
+                </p>
+              </div>
+
+              <div>
+                <label className={labelCls}>额外环境变量（每行 KEY=VALUE）</label>
+                <textarea
+                  className={inputCls + ' font-mono text-xs h-24 resize-none'}
+                  value={form.extra_env_vars}
+                  onChange={e => set('extra_env_vars', e.target.value)}
+                  placeholder={`# V100 异构 PCIe 多卡卡死时需要：\nNCCL_P2P_DISABLE=1\nNCCL_DEBUG=WARN`}
+                />
+                <p className="text-[11px] text-slate-400 mt-1 leading-relaxed">
+                  注入 vllm 子进程的环境变量。后端已默认设：多卡时 <code className="px-1 bg-slate-100 rounded">VLLM_WORKER_MULTIPROC_METHOD=spawn</code> 与 <code className="px-1 bg-slate-100 rounded">NCCL_IB_DISABLE=1</code>。
+                  V100 异构 GPU 主机多卡卡死可加 <code className="px-1 bg-slate-100 rounded">NCCL_P2P_DISABLE=1</code>。这里写的值优先级最高，会覆盖默认。
                 </p>
               </div>
             </>

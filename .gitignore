@@ -60,3 +60,4 @@ backend/.env
 *.zip
 link*.sh
 serve_model_*.sh
+/gitToken.txt

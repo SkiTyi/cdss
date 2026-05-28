@@ -231,6 +231,11 @@ class LLMAssistant(Base):
     model_path = Column(String(1000), nullable=True)   # filesystem path on the server
     max_model_len = Column(Integer, nullable=True)     # vllm --max-model-len
     extra_vllm_args = Column(JSON, default=[])         # additional vllm CLI flags as list[str]
+    # Extra env vars merged into the vllm subprocess env (dict[str, str]).
+    # Use this for runtime knobs that aren't CLI flags — e.g. on V100 hosts
+    # with heterogeneous PCIe topology, set NCCL_P2P_DISABLE=1 here to avoid
+    # NCCL's P2P probe deadlock during multi-GPU startup.
+    extra_env_vars = Column(JSON, default={})
     lora_adapter_path = Column(String(1000), nullable=True)  # optional adapter dir; enables --enable-lora
     # gpu_ids semantics (mirrors training):
     #   None / missing → auto: don't override CUDA_VISIBLE_DEVICES

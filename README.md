@@ -157,6 +157,32 @@ npm run dev                                  # 默认 5173
 
 混型 GPU 主机（如 V100-DGXS + V100-PCIE 共存）已在 `_subprocess_env.py` 默认设置 `CUDA_DEVICE_ORDER=PCI_BUS_ID`，确保 `CUDA_VISIBLE_DEVICES=N` 选中的卡与 `nvidia-smi` 显示一致。
 
+### 多卡 vllm（tensor parallel）
+
+后端检测到 `gpu_ids` 数量 > 1 时自动：
+- 注入 `--tensor-parallel-size <N>`
+- 把环境变量 `VLLM_WORKER_MULTIPROC_METHOD=spawn` 喂进子进程（**重要**：默认 `fork` 在 CUDA 下会与 worker 进程死锁，症状是日志停在 `Started engine process` 之后再无任何输出直到我们的监控超时）
+- 把 `NCCL_IB_DISABLE=1` 喂进子进程（避开 InfiniBand 探测的 30~120s 超时；不影响 NVLink 吞吐）
+- 用 `start_new_session=True` 让 vllm leader + 所有 TP worker 在同一会话中；停止时用 `killpg(SIGTERM → SIGKILL)` 一锅端，避免 V100 上 NCCL 死锁导致的 worker 僵尸（占着每卡 ~700 MB CUDA context 不释放）
+- 监控超时按 GPU 数线性放大：单卡 10 分钟，2 卡 15 分钟，N 卡 = 600 + 300×(N-1) 秒
+
+### V100 异构 GPU 主机（重点）
+
+如果服务器同时插了 V100-DGXS（带 NVLink）+ V100-PCIE / V100S-PCIE 等不同 SKU，**NCCL 在多卡初始化 `ncclCommInitRank` 时会卡死**——因为它会对所有 GPU 对做 P2P 探测，而异构 PCIe 桥之间 P2P 实际不可用却走死等协议。日志症状：
+
+```
+INFO ... pynccl.py:63] vLLM is using nccl==2.20.5
+（之后再无任何输出，监控线程一直 still waiting）
+```
+
+在助手编辑表单的"额外环境变量"里加：
+
+```
+NCCL_P2P_DISABLE=1
+```
+
+这会让 NCCL 走 CPU 中转代替 GPU 直连，单节点同 PCIe 主机性能损失约 30~50%，但功能正确不再卡死。如果还有问题再加 `NCCL_DEBUG=INFO` 把 NCCL 的初始化过程打印到日志里精确定位。
+
 ### 助手健康检查匹配规则（V100 用户重点）
 
 老版本 vllm 在 `/v1/models` 返回的 `id` 字段大小写、路径前缀可能与你填的 `model_name` 略有差异。`vllm_manager._ping_vllm` 已升级为三档匹配：
@@ -166,38 +192,14 @@ npm run dev                                  # 默认 5173
 
 每次轮询的结果会写进 `backend/vllm_logs/assistant_<id>.log`，可以 `tail -f` 跟踪。
 
-### 多卡 vllm（tensor parallel）
-
-后端检测到 `gpu_ids` 数量 > 1 时自动：
-- 注入 `--tensor-parallel-size <N>`
-- 把环境变量 `VLLM_WORKER_MULTIPROC_METHOD=spawn` 喂进子进程（**重要**：默认 `fork` 在 CUDA 下会与 worker 进程死锁，症状是日志停在 `Started engine process` 之后再无任何输出直到我们的监控超时）
-- 监控超时按 GPU 数线性放大：单卡 10 分钟，2 卡 15 分钟，N 卡 = 600 + 300×(N-1) 秒
-
-如果多卡仍然卡住，按这个顺序排查（依次试，每次只加一个变量）：
-
-```bash
-# 1. 关 P2P（V100 或 PCIe Gen3 主板上 P2P 偶发不稳定）
-# 在助手的 extra_vllm_args 加不了 env vars — 临时改在助手启动前 export
-export NCCL_P2P_DISABLE=1
-
-# 2. 关 InfiniBand 探测（没有 IB 卡却让 NCCL 去探，会等超时）
-export NCCL_IB_DISABLE=1
-
-# 3. 让 NCCL 把握手过程详细打出来
-export NCCL_DEBUG=INFO
-
-# 4. 显式禁掉 NVLink，强制走 PCIe
-export NCCL_P2P_LEVEL=PIX
-```
-
-确认有效后，把对应的 export 写进启动后端的 shell 脚本里持久化。
-
 ## 常见问题
 
 | 现象 | 排查 |
 |---|---|
 | 助手按钮卡在「启动中」 | `tail -f backend/vllm_logs/assistant_<id>.log`，找 `[manager] still waiting` 行查最后一次 ping 失败原因 |
 | 多卡助手日志停在 `Started engine process` 后无任何输出 | 多进程死锁；确认 `VLLM_WORKER_MULTIPROC_METHOD=spawn` 已生效（本项目自动设），若无效再按上文「多卡 vllm」段试 NCCL_P2P_DISABLE / NCCL_IB_DISABLE |
+| 多卡助手日志停在 `vLLM is using nccl==X.Y.Z` 后无输出 | V100 异构 PCIe 主机的 NCCL P2P 探测死锁；助手「额外环境变量」加 `NCCL_P2P_DISABLE=1` |
+| 停止多卡助手后 `nvidia-smi` 仍有进程占着每卡 ~700MB | 老版本会出现 — 升级到本版后 stop() 已改 killpg 整组终止；若仍有残留，`pkill -9 -f vllm` 兜底 |
 | `libnvJitLink.so.13: cannot open shared object file` | 没装匹配版本的 `cuda-toolkit`，或 `_subprocess_env.py` 没发现 conda env；用 `conda install -c nvidia cuda-toolkit=<X>.0` 装上 |
 | CPT eval 阶段 OOM | 已通过 `prediction_loss_only=True` + `eval_do_concat_batches=False` 缓解；如仍 OOM，调小 `block_size`（默认 2048） |
 | 训练 loss 图不显示 | Recharts 要求 `<Line>` 必须直接作为 `<LineChart>` 子节点，不能包 `<>...</>` Fragment |

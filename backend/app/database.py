@@ -28,6 +28,7 @@ def run_migrations():
         ("extraction_jobs", "task_type", "VARCHAR(50) DEFAULT 'qa_extraction'"),
         ("extraction_jobs", "assistant_id", "INTEGER"),
         ("llm_assistants", "gpu_ids", "JSON"),
+        ("llm_assistants", "extra_env_vars", "JSON"),
         ("evaluation_runs", "phase", "VARCHAR(30) DEFAULT 'pending'"),
     ]
     with engine.connect() as conn:

@@ -14,6 +14,7 @@ log/sampling/scheduling tweaks like --disable-log-requests,
 between versions.
 """
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -201,6 +202,19 @@ class VLLMManager:
         # Forcing `spawn` is the canonical fix (vllm docs + GH issues).
         if is_multi_gpu:
             env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+            # InfiniBand probing is always-on by default in NCCL. On consumer
+            # / single-node lab boxes there is no IB, but the probe still
+            # takes 30~120 s to time out per worker. Disable it explicitly.
+            # This does NOT slow down NVLink hosts.
+            env.setdefault("NCCL_IB_DISABLE", "1")
+
+        # User-supplied env vars (highest precedence — overrides any default
+        # we set above). Used for hardware-specific knobs like
+        # NCCL_P2P_DISABLE=1 on V100 hosts with heterogeneous PCIe topology
+        # (where NCCL's P2P probe deadlocks during ncclCommInitRank).
+        for k, v in (assistant.extra_env_vars or {}).items():
+            if k:
+                env[str(k)] = str(v)
 
         # ── max-model-len (still a first-class field on the form) ─────────
         if assistant.max_model_len and not _has_flag(
@@ -223,7 +237,12 @@ class VLLMManager:
 
         log_f = open(log_path, "w", encoding="utf-8", buffering=1)
         log_f.write(f"$ {' '.join(cmd)}\n")
-        log_f.write(f"$ CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES', '<unset>')}\n\n")
+        log_f.write(f"$ CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES', '<unset>')}\n")
+        # Surface NCCL-related env so users can see why their tweaks did/didn't take.
+        nccl_env = {k: v for k, v in env.items() if k.startswith("NCCL_") or k == "VLLM_WORKER_MULTIPROC_METHOD"}
+        if nccl_env:
+            log_f.write(f"$ NCCL/VLLM env: {nccl_env}\n")
+        log_f.write("\n")
         log_f.flush()
 
         try:
@@ -232,6 +251,14 @@ class VLLMManager:
                 stdout=log_f,
                 stderr=subprocess.STDOUT,
                 env=env,
+                # Put vllm + all its spawned workers into a fresh session.
+                # Without this the worker subprocesses (3 extra PIDs on TP=4)
+                # have no parent–group relationship with our managed leader,
+                # and proc.terminate()/kill() only signals the leader — the
+                # workers stay orphaned, each holding ~700 MB of CUDA context
+                # + NCCL state. With start_new_session=True we can later
+                # os.killpg(proc.pid, …) and reap everyone.
+                start_new_session=True,
             )
         except FileNotFoundError as e:
             log_f.close()
@@ -267,14 +294,47 @@ class VLLMManager:
 
         return port
 
+    @staticmethod
+    def _terminate_group(proc: subprocess.Popen, grace_sec: int = 20):
+        """SIGTERM the entire process group, escalate to SIGKILL if needed.
+
+        Because we spawned with start_new_session=True, the vllm leader is
+        the session leader; signalling its PGID hits every descendant —
+        including the TP worker processes that would otherwise leak GPU
+        contexts.
+        """
+        if proc.poll() is not None:
+            return
+        try:
+            pgid = os.getpgid(proc.pid)
+        except (ProcessLookupError, PermissionError):
+            pgid = proc.pid
+
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        try:
+            proc.wait(timeout=grace_sec)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+
+        # Still alive — escalate. NCCL-deadlocked workers won't respect TERM.
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            # Last resort — at least mark the leader dead from our PoV.
+            pass
+
     def stop(self, assistant_id: int, db_factory):
         proc = self._procs.get(assistant_id)
         if proc and proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=20)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            self._terminate_group(proc)
         self._procs.pop(assistant_id, None)
 
         # Release the port back into the pool. Read it from DB since the

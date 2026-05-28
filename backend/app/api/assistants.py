@@ -1,6 +1,6 @@
 """LLM Assistant CRUD + lifecycle endpoints."""
 import subprocess
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -65,6 +65,7 @@ class CreateAssistantRequest(BaseModel):
     model_path: Optional[str] = None
     max_model_len: Optional[int] = None
     extra_vllm_args: Optional[List[str]] = None
+    extra_env_vars: Optional[Dict[str, str]] = None
     lora_adapter_path: Optional[str] = None
     gpu_ids: Optional[List[int]] = None       # None=auto, [0]=single, [0,1]=multi
     source_experiment_id: Optional[int] = None
@@ -79,6 +80,7 @@ class UpdateAssistantRequest(BaseModel):
     model_path: Optional[str] = None
     max_model_len: Optional[int] = None
     extra_vllm_args: Optional[List[str]] = None
+    extra_env_vars: Optional[Dict[str, str]] = None
     lora_adapter_path: Optional[str] = None
     gpu_ids: Optional[List[int]] = None
 
@@ -97,6 +99,7 @@ def _serialize(a: LLMAssistant, include_secrets: bool = False) -> dict:
         "model_path": a.model_path,
         "max_model_len": a.max_model_len,
         "extra_vllm_args": a.extra_vllm_args or [],
+        "extra_env_vars": a.extra_env_vars or {},
         "lora_adapter_path": a.lora_adapter_path,
         "gpu_ids": a.gpu_ids,
         "port": a.port,
@@ -185,6 +188,7 @@ def create_assistant(req: CreateAssistantRequest, db: Session = Depends(get_db))
             model_name=(req.model_name or "").strip(),
             max_model_len=req.max_model_len,
             extra_vllm_args=req.extra_vllm_args or [],
+            extra_env_vars=req.extra_env_vars or {},
             lora_adapter_path=(req.lora_adapter_path or "").strip() or None,
             gpu_ids=_normalize_gpu_ids(req.gpu_ids),
             source_experiment_id=req.source_experiment_id,
@@ -231,6 +235,9 @@ def update_assistant(assistant_id: int, req: UpdateAssistantRequest, db: Session
         a.api_key = (req.api_key or "").strip() or None
     if req.extra_vllm_args is not None:
         a.extra_vllm_args = req.extra_vllm_args
+    if req.extra_env_vars is not None:
+        # Normalize: ensure all keys/values are strings
+        a.extra_env_vars = {str(k): str(v) for k, v in (req.extra_env_vars or {}).items()}
     if req.gpu_ids is not None:
         a.gpu_ids = _normalize_gpu_ids(req.gpu_ids)
 
