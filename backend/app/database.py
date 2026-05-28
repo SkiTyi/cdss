@@ -30,6 +30,7 @@ def run_migrations():
         # Phase 1: augmentation lineage
         ("extraction_jobs", "source_job_id", "INTEGER"),
         ("extraction_jobs", "augment_strategies", "JSON"),
+        ("extraction_jobs", "config", "JSON"),
         ("llm_assistants", "gpu_ids", "JSON"),
         ("llm_assistants", "extra_env_vars", "JSON"),
         ("evaluation_runs", "phase", "VARCHAR(30) DEFAULT 'pending'"),

@@ -12,9 +12,8 @@ from ..services.extractor import (
 router = APIRouter(prefix="/extraction", tags=["extraction"])
 
 
-# Phase 1: task_type ∈ {case_extract, guideline_synth, case_reasoning}
-# (augment is reserved for Step 1.3 and not yet wired into create_job)
-_VALID_TASK_TYPES = {"case_extract", "guideline_synth", "case_reasoning"}
+# Phase 1: task_type ∈ {case_extract, guideline_synth, case_reasoning, augment}
+_VALID_TASK_TYPES = {"case_extract", "guideline_synth", "case_reasoning", "augment"}
 
 
 class CreateJobRequest(BaseModel):
@@ -26,9 +25,15 @@ class CreateJobRequest(BaseModel):
     base_url: Optional[str] = None
     api_key: Optional[str] = None
     doc_limit: Optional[int] = None
-    # document_type is now derived from task_type for most cases but kept
-    # so future extensions (e.g. mixed-source extraction) can override.
     document_type: Optional[str] = None
+    # Augment-mode (task_type='augment') fields — see Step 1.3
+    source_job_id: Optional[int] = None
+    augment_strategies: Optional[List[str]] = None
+    # Per-task-type config dict, see ExtractionJob.config docstring.
+    #   guideline_synth.n_per_doc  → patients per guideline (default 8)
+    #   augment.variants_per_strategy → variants per (source instance, strategy)
+    #   augment.max_source_instances  → cap on source instances to operate on
+    config: Optional[dict] = None
 
 
 def _serialize_job(j: ExtractionJob):
@@ -39,6 +44,9 @@ def _serialize_job(j: ExtractionJob):
         "assistant_id": j.assistant_id,
         "model": j.model, "base_url": j.base_url,
         "has_api_key": bool(j.api_key),
+        "source_job_id": j.source_job_id,
+        "augment_strategies": j.augment_strategies or [],
+        "config": j.config or {},
         "status": j.status,
         "total_docs": j.total_docs, "processed_docs": j.processed_docs,
         "failed_docs": j.failed_docs, "error_message": j.error_message,
@@ -84,12 +92,23 @@ def create_job(req: CreateJobRequest, background_tasks: BackgroundTasks, db: Ses
     if task_type not in _VALID_TASK_TYPES:
         raise HTTPException(400, f"未知的 task_type：{task_type}（合法值：{sorted(_VALID_TASK_TYPES)}）")
 
-    # task_type implies document type
-    document_type = req.document_type or {
-        "guideline_synth": "guideline",
-        "case_extract": "case_report",
-        "case_reasoning": "case_report",
-    }[task_type]
+    # task_type implies document type for extraction jobs.
+    # augment jobs operate on an upstream job's instances — they don't pull
+    # documents directly, so document_type is meaningless there.
+    if task_type == "augment":
+        if not req.source_job_id:
+            raise HTTPException(400, "augment 任务必须指定 source_job_id")
+        if not db.query(ExtractionJob).filter_by(id=req.source_job_id).first():
+            raise HTTPException(404, f"source_job_id={req.source_job_id} 对应的任务不存在")
+        if not req.augment_strategies:
+            raise HTTPException(400, "augment 任务必须至少指定一项 augment_strategies")
+        document_type = None
+    else:
+        document_type = req.document_type or {
+            "guideline_synth": "guideline",
+            "case_extract": "case_report",
+            "case_reasoning": "case_report",
+        }[task_type]
 
     if req.assistant_id:
         from ..models.models import LLMAssistant
@@ -106,6 +125,9 @@ def create_job(req: CreateJobRequest, background_tasks: BackgroundTasks, db: Ses
         base_url=base_url,
         api_key=api_key,
         doc_limit=req.doc_limit,
+        source_job_id=req.source_job_id,
+        augment_strategies=req.augment_strategies,
+        config=req.config or {},
     )
     db.add(job)
     db.commit()
@@ -259,4 +281,26 @@ def get_default_prompts():
         "case_extract":    CASE_PROMPT,
         "guideline_synth": GUIDELINE_PROMPT,
         "case_reasoning":  CLINICAL_REASONING_PROMPT,
+    }
+
+
+@router.get("/augment/strategies")
+def list_augment_strategies():
+    """Strategy catalog for the create-augment-job UI."""
+    from ..services.augmenter import STRATEGIES, DEFAULT_STRATEGIES
+    catalog = [
+        ("aug_paraphrase",  "改写增强",   "改变表述风格（医生/患者/护士视角变换），保持医学事实不变",  True),
+        ("aug_distractor",  "干扰注入",   "插入 1~2 条与诊断无关的既往史/家族史/用药史，模拟真实病历噪音",  True),
+        ("aug_cot",         "CoT 扩写",   "把简短答案扩展为含 5 步显式推理链的完整答案",  True),
+        ("aug_hardneg",     "困难负样本", "基于鉴别诊断方向改写，使新场景应被诊断为另一相似疾病（Phase 2 DPO 种子）",  False),
+        ("aug_comorbidity", "合并症叠加", "叠加常见合并症并相应调整治疗/监测建议（answer 会变）",  False),
+    ]
+    return {
+        "strategies": [
+            {"name": n, "label": lbl, "desc": d, "default": n in DEFAULT_STRATEGIES,
+             "recommended": rec}
+            for n, lbl, d, rec in catalog
+            if n in STRATEGIES
+        ],
+        "defaults": DEFAULT_STRATEGIES,
     }

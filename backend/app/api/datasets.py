@@ -1,14 +1,25 @@
 import json
 import random
+from collections import defaultdict
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from typing import Optional, List
 from pydantic import BaseModel
 from ..database import get_db
 from ..models.models import Dataset, DatasetItem, DiagnosticInstance
 
 router = APIRouter(prefix="/datasets", tags=["datasets"])
+
+
+# Sampling strategies for dataset construction.
+#   none              — take all candidates (after filters), no rebalancing
+#   proportional      — same as none + optional max_per_disease cap; preserves
+#                       the natural disease distribution but caps head classes
+#   uniform_by_disease — take min(max_per_disease or smallest_bucket, bucket_size)
+#                       from every label; rebalances toward uniform across diseases
+_SAMPLING_STRATEGIES = {"none", "proportional", "uniform_by_disease"}
 
 
 class CreateDatasetRequest(BaseModel):
@@ -19,7 +30,22 @@ class CreateDatasetRequest(BaseModel):
     instance_ids: Optional[List[int]] = None    # explicit set
     job_id: Optional[int] = None                # all instances from a job
     approved_only: bool = False                 # restrict to is_approved=True
+    # Phase 1 Step 1.4: filtering + sampling
+    include_strategies: Optional[List[str]] = None  # whitelist of synthesis_strategy values
+    sampling_strategy: str = "proportional"
+    max_per_disease: Optional[int] = None
+    seed: Optional[int] = None                  # for reproducible sampling
     system_prompt: Optional[str] = "你是一位专业的临床医学助手，请根据患者的病情描述给出专业的诊断分析和治疗建议。"
+
+
+class PreviewSourceRequest(BaseModel):
+    job_id: Optional[int] = None
+    instance_ids: Optional[List[int]] = None
+    approved_only: bool = False
+    include_strategies: Optional[List[str]] = None
+    sampling_strategy: str = "proportional"
+    max_per_disease: Optional[int] = None
+    top: int = 30   # how many diagnoses to surface in the head histogram
 
 
 def _serialize_dataset(d: Dataset):
@@ -36,25 +62,161 @@ def list_datasets(db: Session = Depends(get_db)):
     return [_serialize_dataset(d) for d in datasets]
 
 
+def _build_source_query(db, *, job_id=None, instance_ids=None,
+                        approved_only=False, include_strategies=None):
+    """Common filter assembly for both preview-source and create_dataset.
+
+    Returns a SQLAlchemy query over DiagnosticInstance with the given
+    filters applied. Caller is responsible for execution and any further
+    in-memory sampling.
+    """
+    q = db.query(DiagnosticInstance)
+    if instance_ids:
+        q = q.filter(DiagnosticInstance.id.in_(instance_ids))
+    elif job_id:
+        q = q.filter(DiagnosticInstance.job_id == job_id)
+    if approved_only:
+        q = q.filter(DiagnosticInstance.is_approved == True)
+    if include_strategies:
+        q = q.filter(DiagnosticInstance.synthesis_strategy.in_(include_strategies))
+    return q
+
+
+def _apply_sampling(instances, strategy, max_per_disease, seed=None):
+    """In-memory sampler. Groups by diagnosis_label then applies the policy.
+
+    Empty string and None are merged into one "(未标注)" bucket so untagged
+    rows don't silently get dropped or all collide into a giant bucket
+    under different keys.
+    """
+    if strategy not in _SAMPLING_STRATEGIES:
+        raise HTTPException(400, f"未知的 sampling_strategy：{strategy}")
+
+    if strategy == "none":
+        return list(instances)
+
+    rng = random.Random(seed) if seed is not None else random.Random()
+
+    buckets = defaultdict(list)
+    for inst in instances:
+        buckets[inst.diagnosis_label or "(未标注)"].append(inst)
+
+    if not buckets:
+        return []
+
+    if strategy == "proportional":
+        # Keep natural distribution; only cap each bucket if max_per_disease set.
+        result = []
+        for label, items in buckets.items():
+            if max_per_disease and len(items) > max_per_disease:
+                items = rng.sample(items, max_per_disease)
+            result.extend(items)
+        return result
+
+    if strategy == "uniform_by_disease":
+        # Take the same N from each bucket; if N not specified, use the
+        # smallest bucket size (truly uniform), else cap each at min(N, size).
+        if max_per_disease:
+            target = max_per_disease
+        else:
+            target = min(len(items) for items in buckets.values())
+        result = []
+        for label, items in buckets.items():
+            if len(items) > target:
+                items = rng.sample(items, target)
+            result.extend(items)
+        return result
+
+    return list(instances)  # unreachable
+
+
+@router.post("/preview-source")
+def preview_source(req: PreviewSourceRequest, db: Session = Depends(get_db)):
+    """Show distribution + projected count BEFORE building a dataset.
+
+    Returns:
+      total_candidates:   rows passing the filters (before sampling)
+      projected_count:    rows that WOULD end up in the dataset after sampling
+      distinct_diagnoses: number of unique diagnosis_label values
+      strategy_breakdown: {synthesis_strategy: count} over candidates
+      head:               top-N diagnosis labels with (count, projected_count)
+      singletons:         labels with only 1 candidate (long-tail signal)
+    """
+    q = _build_source_query(db,
+        job_id=req.job_id, instance_ids=req.instance_ids,
+        approved_only=req.approved_only,
+        include_strategies=req.include_strategies)
+
+    candidates = q.all()
+    total_candidates = len(candidates)
+    if total_candidates == 0:
+        return {
+            "total_candidates": 0, "projected_count": 0,
+            "distinct_diagnoses": 0, "strategy_breakdown": {},
+            "head": [], "singletons": 0,
+        }
+
+    # Strategy breakdown
+    strategy_breakdown = defaultdict(int)
+    label_count = defaultdict(int)
+    for inst in candidates:
+        strategy_breakdown[inst.synthesis_strategy or "(未知)"] += 1
+        label_count[inst.diagnosis_label or "(未标注)"] += 1
+
+    # Projected per-label counts under the requested sampling policy
+    if req.sampling_strategy == "none":
+        projected_per_label = dict(label_count)
+    elif req.sampling_strategy == "proportional":
+        cap = req.max_per_disease
+        projected_per_label = {
+            lbl: (min(n, cap) if cap else n) for lbl, n in label_count.items()
+        }
+    elif req.sampling_strategy == "uniform_by_disease":
+        target = req.max_per_disease or min(label_count.values())
+        projected_per_label = {lbl: min(n, target) for lbl, n in label_count.items()}
+    else:
+        raise HTTPException(400, f"未知的 sampling_strategy：{req.sampling_strategy}")
+
+    projected_count = sum(projected_per_label.values())
+
+    # Head histogram — top-N by candidate count
+    sorted_labels = sorted(label_count.items(), key=lambda kv: kv[1], reverse=True)
+    head = [
+        {"label": lbl, "count": n, "projected_count": projected_per_label.get(lbl, 0)}
+        for lbl, n in sorted_labels[:req.top]
+    ]
+    singletons = sum(1 for _, n in label_count.items() if n == 1)
+
+    return {
+        "total_candidates": total_candidates,
+        "projected_count": projected_count,
+        "distinct_diagnoses": len(label_count),
+        "strategy_breakdown": dict(strategy_breakdown),
+        "head": head,
+        "singletons": singletons,
+    }
+
+
 @router.post("")
 def create_dataset(req: CreateDatasetRequest, db: Session = Depends(get_db)):
+    if req.sampling_strategy not in _SAMPLING_STRATEGIES:
+        raise HTTPException(400, f"未知的 sampling_strategy：{req.sampling_strategy}")
+
     dataset = Dataset(name=req.name, description=req.description, format=req.format)
     db.add(dataset)
     db.commit()
     db.refresh(dataset)
 
-    # Pull instances. Phase 1: one DiagnosticInstance ↔ one DatasetItem.
-    q = db.query(DiagnosticInstance)
-    if req.instance_ids:
-        q = q.filter(DiagnosticInstance.id.in_(req.instance_ids))
-    elif req.job_id:
-        q = q.filter(DiagnosticInstance.job_id == req.job_id)
-    if req.approved_only:
-        q = q.filter(DiagnosticInstance.is_approved == True)
+    candidates = _build_source_query(db,
+        job_id=req.job_id, instance_ids=req.instance_ids,
+        approved_only=req.approved_only,
+        include_strategies=req.include_strategies).all()
 
-    items = q.all()
+    sampled = _apply_sampling(candidates, req.sampling_strategy,
+                              req.max_per_disease, req.seed)
+
     count = 0
-    for inst in items:
+    for inst in sampled:
         presentation = (inst.presentation or "").strip()
         answer = (inst.answer or "").strip()
         if not presentation or not answer:

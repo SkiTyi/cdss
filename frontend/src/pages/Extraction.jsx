@@ -10,10 +10,10 @@ const STATUS_CONFIG = {
   failed: { label: '失败', color: 'bg-red-100 text-red-700', icon: XCircle },
 }
 
-function CreateJobModal({ onClose, onCreated }) {
+function CreateJobModal({ onClose, onCreated, existingJobs }) {
   const [form, setForm] = useState({
     name: '',
-    task_type: 'case_extract',          // case_extract | guideline_synth | case_reasoning
+    task_type: 'case_extract',          // case_extract | guideline_synth | case_reasoning | augment
     llm_mode: 'assistant',              // assistant | manual
     assistant_id: '',
     base_url: '',
@@ -21,10 +21,18 @@ function CreateJobModal({ onClose, onCreated }) {
     api_key: '',
     prompt_template: '',
     doc_limit: '',
+    // guideline_synth
+    n_per_doc: 8,
+    // augment
+    source_job_id: '',
+    augment_strategies: [],
+    max_source_instances: 200,
+    variants_per_strategy: 1,
   })
   const [defaults, setDefaults] = useState({})
   const [assistantList, setAssistantList] = useState([])
   const [docStats, setDocStats] = useState(null)
+  const [augStrategies, setAugStrategies] = useState([])
   const [loading, setLoading] = useState(false)
   const [showKey, setShowKey] = useState(false)
   const [err, setErr] = useState('')
@@ -32,6 +40,10 @@ function CreateJobModal({ onClose, onCreated }) {
   useEffect(() => {
     extraction.defaultPrompts().then(r => setDefaults(r.data))
     documentsApi.stats().then(r => setDocStats(r.data)).catch(() => {})
+    extraction.augmentStrategies().then(r => {
+      setAugStrategies(r.data.strategies || [])
+      setForm(f => ({ ...f, augment_strategies: r.data.defaults || [] }))
+    }).catch(() => {})
     assistantsApi.list().then(r => {
       const ready = r.data.filter(a => a.status === 'running')
       setAssistantList(ready)
@@ -44,23 +56,41 @@ function CreateJobModal({ onClose, onCreated }) {
   }, [])
 
   const useAssistant = form.llm_mode === 'assistant'
+  const isAugment = form.task_type === 'augment'
+  const isGuidelineSynth = form.task_type === 'guideline_synth'
 
   // task_type implies which document type the job will pull from.
-  const docTypeForTask = form.task_type === 'guideline_synth' ? 'guideline' : 'case_report'
-  const availableDocs = docStats == null ? null
+  const docTypeForTask = isGuidelineSynth ? 'guideline' : 'case_report'
+  const availableDocs = (docStats == null || isAugment) ? null
     : docTypeForTask === 'guideline' ? docStats.guidelines : docStats.case_reports
+
+  // Completed extraction jobs that can serve as source for augment
+  const augmentableJobs = (existingJobs || []).filter(j =>
+    j.status === 'completed' && ['case_extract', 'guideline_synth', 'case_reasoning'].includes(j.task_type)
+  )
 
   const isLocal = /(localhost|127\.0\.0\.1|0\.0\.0\.0|::1)/i.test(form.base_url)
   const needKey = !useAssistant && form.base_url.trim() && !isLocal && !form.api_key.trim()
 
-  // Default-template key matches the backend prompts dict.
   const defaultTemplateKey = form.task_type
+
+  const toggleStrategy = (name) => {
+    setForm(f => {
+      const set = new Set(f.augment_strategies || [])
+      set.has(name) ? set.delete(name) : set.add(name)
+      return { ...f, augment_strategies: [...set] }
+    })
+  }
 
   const handleSubmit = async () => {
     setErr('')
     if (!form.name) return
     if (useAssistant && !form.assistant_id) { setErr('请选择一个助手'); return }
     if (needKey) { setErr('远程 base_url 必须提供 api_key（仅 localhost 可为空）'); return }
+    if (isAugment) {
+      if (!form.source_job_id) { setErr('请选择源任务'); return }
+      if (!form.augment_strategies?.length) { setErr('请至少勾选一项增强策略'); return }
+    }
     setLoading(true)
     try {
       const payload = {
@@ -68,6 +98,7 @@ function CreateJobModal({ onClose, onCreated }) {
         task_type: form.task_type,
         prompt_template: form.prompt_template || undefined,
         doc_limit: form.doc_limit ? parseInt(form.doc_limit) : undefined,
+        config: {},
       }
       if (useAssistant) {
         payload.assistant_id = Number(form.assistant_id)
@@ -75,6 +106,15 @@ function CreateJobModal({ onClose, onCreated }) {
         payload.base_url = form.base_url.trim() || undefined
         payload.model = form.model.trim() || undefined
         payload.api_key = form.api_key.trim() || undefined
+      }
+      if (isGuidelineSynth) {
+        payload.config.n_per_doc = Number(form.n_per_doc) || 8
+      }
+      if (isAugment) {
+        payload.source_job_id = Number(form.source_job_id)
+        payload.augment_strategies = form.augment_strategies
+        payload.config.max_source_instances = Number(form.max_source_instances) || 200
+        payload.config.variants_per_strategy = Number(form.variants_per_strategy) || 1
       }
       await extraction.createJob(payload)
       onCreated()
@@ -101,12 +141,14 @@ function CreateJobModal({ onClose, onCreated }) {
             <label className="text-xs text-slate-500 mb-1 block">任务类型 *</label>
             <div className="space-y-2">
               {[
-                ['case_extract', '病例 → QA 抽取', 'case_report',
-                  '从临床病例报告中抽取 (问题, 答案) 训练实例。Phase 1 暂沿用旧 prompt；Step 1.2 会换成"完整病例 → 诊断+推理链"的形态'],
-                ['guideline_synth', '指南 → QA 合成', 'guideline',
-                  '从临床指南中提取 QA。Step 1.2 会扩展为"指南 → N 个虚拟患者就诊场景"（产出密度提升一个数量级）'],
-                ['case_reasoning', '病例推理合成', 'case_report',
-                  '基于真实病例合成脱敏 + 含推理链的多场景训练样本（每篇产 2~4 条 instance）'],
+                ['case_extract', '病例 → 单实例', 'case_report',
+                  '每篇病例产出 1 条 (presentation, answer) 训练样本：完整脱敏就诊场景 + 5 步推理 answer'],
+                ['guideline_synth', '指南 → N 个虚拟患者', 'guideline',
+                  '为指南诊断标准合成 N 个不同年龄/性别/合并症/严重度的虚拟患者就诊场景（产出密度提升一个数量级）'],
+                ['case_reasoning', '病例多场景合成', 'case_report',
+                  '每篇病例产出 2~4 条高多样性场景（诊断推理/鉴别/治疗规划）'],
+                ['augment', '增强：基于已有 job 扩样本', null,
+                  '对一个已完成 job 的 base instance 跑改写/干扰/CoT 扩写等策略，每条 base 产 N 个变体'],
               ].map(([k, label, srcType, desc]) => (
                 <label key={k}
                   className={`flex items-start gap-2 p-3 rounded-lg border cursor-pointer transition-colors
@@ -117,16 +159,21 @@ function CreateJobModal({ onClose, onCreated }) {
                   <div className="min-w-0 flex-1">
                     <p className="text-sm font-medium text-slate-700 flex items-center gap-2">
                       {label}
-                      <span className="text-[11px] font-normal text-slate-400">
-                        源：{srcType === 'guideline' ? '指南' : '病例报告'}
-                      </span>
+                      {srcType && (
+                        <span className="text-[11px] font-normal text-slate-400">
+                          源：{srcType === 'guideline' ? '指南' : '病例报告'}
+                        </span>
+                      )}
+                      {!srcType && (
+                        <span className="text-[11px] font-normal text-purple-500">源：上游 job</span>
+                      )}
                     </p>
                     <p className="text-xs text-slate-400 mt-0.5 leading-relaxed">{desc}</p>
                   </div>
                 </label>
               ))}
             </div>
-            {docStats != null && (
+            {!isAugment && docStats != null && (
               <p className={`mt-2 text-xs flex items-center gap-1 ${availableDocs > 0 ? 'text-slate-500' : 'text-red-500'}`}>
                 <span>当前可用源文档：<b className={availableDocs > 0 ? 'text-slate-700' : 'text-red-600'}>{availableDocs}</b> 条</span>
                 {availableDocs === 0 && <span>· 请先到「文档管理」加载</span>}
@@ -137,20 +184,108 @@ function CreateJobModal({ onClose, onCreated }) {
             )}
           </div>
 
-          <div>
-            <label className="text-xs text-slate-500 mb-1 block">
-              处理文档数量上限
-              <span className="ml-1 text-slate-400">（留空则处理全部文档）</span>
-            </label>
-            <input
-              type="number"
-              min="1"
-              className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-              value={form.doc_limit}
-              onChange={e => setForm(f => ({ ...f, doc_limit: e.target.value }))}
-              placeholder={form.task_type === 'case_reasoning' ? '推理合成耗时较长，建议先设 10~30 条试跑' : '例：100（测试时建议先设置小数量）'}
-            />
-          </div>
+          {/* guideline_synth: N 配置 */}
+          {isGuidelineSynth && (
+            <div className="p-3 bg-teal-50/50 border border-teal-100 rounded-lg">
+              <label className="text-xs text-slate-600 mb-1 block font-medium">
+                每篇指南合成虚拟患者数（N）
+              </label>
+              <input
+                type="number"
+                min="2" max="30" step="1"
+                className="w-32 px-3 py-1.5 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-400"
+                value={form.n_per_doc}
+                onChange={e => setForm(f => ({ ...f, n_per_doc: e.target.value }))}
+              />
+              <p className="text-[11px] text-slate-400 mt-1">
+                建议 6~12。N 越大产出越多但单次 LLM 调用越慢且 max_tokens 占用越高（自动按 N 放大）
+              </p>
+            </div>
+          )}
+
+          {/* augment: 源 job 选 + 策略勾 */}
+          {isAugment && (
+            <div className="p-3 bg-purple-50/50 border border-purple-100 rounded-lg space-y-3">
+              <div>
+                <label className="text-xs text-slate-600 mb-1 block font-medium">源任务 *</label>
+                <select
+                  className="w-full px-3 py-1.5 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-400"
+                  value={form.source_job_id}
+                  onChange={e => setForm(f => ({ ...f, source_job_id: e.target.value }))}>
+                  <option value="">请选择一个已完成的抽取任务...</option>
+                  {augmentableJobs.map(j => (
+                    <option key={j.id} value={j.id}>
+                      #{j.id} {j.name} （{j.task_type}, {j.processed_docs} 文档）
+                    </option>
+                  ))}
+                </select>
+                {augmentableJobs.length === 0 && (
+                  <p className="text-[11px] text-amber-600 mt-1">
+                    暂无已完成的抽取任务可作源；请先跑一个 case_extract / guideline_synth / case_reasoning
+                  </p>
+                )}
+              </div>
+
+              <div>
+                <label className="text-xs text-slate-600 mb-1 block font-medium">增强策略 *</label>
+                <div className="space-y-1.5">
+                  {augStrategies.map(s => (
+                    <label key={s.name}
+                      className={`flex items-start gap-2 p-2 rounded border cursor-pointer transition-colors text-xs
+                        ${form.augment_strategies.includes(s.name) ? 'border-purple-400 bg-purple-50' : 'border-slate-200 hover:bg-slate-50'}`}>
+                      <input type="checkbox" className="mt-0.5 accent-purple-600"
+                        checked={form.augment_strategies.includes(s.name)}
+                        onChange={() => toggleStrategy(s.name)} />
+                      <div className="min-w-0 flex-1">
+                        <p className="text-slate-700 font-medium">
+                          {s.label}
+                          {s.recommended && <span className="ml-1.5 text-[10px] text-green-600">推荐</span>}
+                        </p>
+                        <p className="text-[11px] text-slate-400 mt-0.5">{s.desc}</p>
+                      </div>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="text-xs text-slate-600 mb-1 block">源实例上限</label>
+                  <input type="number" min="1" step="50"
+                    className="w-full px-3 py-1.5 text-sm border border-slate-200 rounded-lg focus:outline-none"
+                    value={form.max_source_instances}
+                    onChange={e => setForm(f => ({ ...f, max_source_instances: e.target.value }))} />
+                </div>
+                <div>
+                  <label className="text-xs text-slate-600 mb-1 block">每策略变体数</label>
+                  <input type="number" min="1" max="5" step="1"
+                    className="w-full px-3 py-1.5 text-sm border border-slate-200 rounded-lg focus:outline-none"
+                    value={form.variants_per_strategy}
+                    onChange={e => setForm(f => ({ ...f, variants_per_strategy: e.target.value }))} />
+                </div>
+              </div>
+              <p className="text-[11px] text-slate-400">
+                预计产出：约 <b>{Math.min(Number(form.max_source_instances) || 0, augmentableJobs.find(j => String(j.id) === String(form.source_job_id))?.processed_docs || 0) * form.augment_strategies.length * (Number(form.variants_per_strategy) || 1)}</b> 条变体（每条变体 = 1 次 LLM 调用）
+              </p>
+            </div>
+          )}
+
+          {!isAugment && (
+            <div>
+              <label className="text-xs text-slate-500 mb-1 block">
+                处理文档数量上限
+                <span className="ml-1 text-slate-400">（留空则处理全部文档）</span>
+              </label>
+              <input
+                type="number"
+                min="1"
+                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                value={form.doc_limit}
+                onChange={e => setForm(f => ({ ...f, doc_limit: e.target.value }))}
+                placeholder={form.task_type === 'case_reasoning' ? '推理合成耗时较长，建议先设 10~30 条试跑' : '例：100（测试时建议先设置小数量）'}
+              />
+            </div>
+          )}
 
           <div className="border-t border-slate-100 pt-3">
             <p className="text-xs font-medium text-slate-600 mb-2">LLM 配置</p>
@@ -226,20 +361,22 @@ function CreateJobModal({ onClose, onCreated }) {
             )}
           </div>
 
-          <div className="border-t border-slate-100 pt-3">
-            <div className="flex items-center justify-between mb-1">
-              <label className="text-xs text-slate-500">
-                提示词模板（留空使用默认 · 当前默认：{({case_extract:'病例抽取', guideline_synth:'指南抽取', case_reasoning:'临床推理合成'})[form.task_type]}）
-              </label>
-              <button className="text-xs text-blue-600 hover:underline"
-                onClick={() => setForm(f => ({ ...f, prompt_template: defaults[defaultTemplateKey] || '' }))}>
-                填入默认模板
-              </button>
+          {!isAugment && (
+            <div className="border-t border-slate-100 pt-3">
+              <div className="flex items-center justify-between mb-1">
+                <label className="text-xs text-slate-500">
+                  提示词模板（留空使用默认 · 当前默认：{({case_extract:'病例抽取', guideline_synth:'指南合成', case_reasoning:'临床推理合成'})[form.task_type]}）
+                </label>
+                <button className="text-xs text-blue-600 hover:underline"
+                  onClick={() => setForm(f => ({ ...f, prompt_template: defaults[defaultTemplateKey] || '' }))}>
+                  填入默认模板
+                </button>
+              </div>
+              <textarea className="w-full px-3 py-2 text-xs border border-slate-200 rounded-lg focus:outline-none font-mono h-28 resize-none"
+                value={form.prompt_template} onChange={e => setForm(f => ({ ...f, prompt_template: e.target.value }))}
+                placeholder={isGuidelineSynth ? '使用 {content} 与 {n_patients} 作为占位符' : '使用 {content} 作为文档内容占位符'} />
             </div>
-            <textarea className="w-full px-3 py-2 text-xs border border-slate-200 rounded-lg focus:outline-none font-mono h-28 resize-none"
-              value={form.prompt_template} onChange={e => setForm(f => ({ ...f, prompt_template: e.target.value }))}
-              placeholder="使用 {content} 作为文档内容占位符" />
-          </div>
+          )}
         </div>
 
         {err && <p className="mt-3 text-xs text-red-500">{err}</p>}
@@ -408,6 +545,11 @@ function JobCard({ job, onRefresh }) {
                 指南合成
               </span>
             )}
+            {job.task_type === 'augment' && (
+              <span className="px-2 py-0.5 bg-purple-100 text-purple-700 rounded text-xs shrink-0">
+                增强 ← #{job.source_job_id}
+              </span>
+            )}
           </div>
           <div className="text-xs text-slate-400 flex flex-wrap gap-x-3 gap-y-0.5">
             <span>类型：{job.document_type === 'case_report' ? '病例报告' : job.document_type === 'guideline' ? '指南/共识' : '全部'}</span>
@@ -551,7 +693,7 @@ export default function Extraction() {
         )}
       </div>
 
-      {showCreate && <CreateJobModal onClose={() => setShowCreate(false)} onCreated={load} />}
+      {showCreate && <CreateJobModal onClose={() => setShowCreate(false)} onCreated={load} existingJobs={jobs} />}
     </div>
   )
 }

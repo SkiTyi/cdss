@@ -43,6 +43,11 @@ class ExtractionJob(Base):
     # and which augmentation strategies to apply (list of strategy names).
     source_job_id = Column(Integer, ForeignKey("extraction_jobs.id"), nullable=True)
     augment_strategies = Column(JSON, nullable=True)
+    # Per-task-type knobs. Keys read by the corresponding processor:
+    #   guideline_synth: n_per_doc (int, default 8)
+    #   augment:         max_source_instances (int, default 200),
+    #                    variants_per_strategy (int, default 1)
+    config = Column(JSON, default={})
     is_cancelled = Column(Boolean, default=False)
     status = Column(String(50), default="pending")  # pending | running | paused | completed | failed | cancelled
     total_docs = Column(Integer, default=0)

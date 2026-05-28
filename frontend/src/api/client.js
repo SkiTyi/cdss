@@ -29,6 +29,7 @@ export const extraction = {
   stats: () => api.get('/extraction/stats'),
   diagnosisDistribution: (top = 30) => api.get('/extraction/diagnosis-distribution', { params: { top } }),
   defaultPrompts: () => api.get('/extraction/prompts/defaults'),
+  augmentStrategies: () => api.get('/extraction/augment/strategies'),
 }
 
 export const datasets = {
@@ -39,6 +40,7 @@ export const datasets = {
   exportUrl: (id) => `/api/datasets/${id}/export`,
   delete: (id) => api.delete(`/datasets/${id}`),
   split: (id, data) => api.post(`/datasets/${id}/split`, data),
+  previewSource: (data) => api.post('/datasets/preview-source', data),
 }
 
 export const training = {
