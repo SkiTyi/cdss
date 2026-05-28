@@ -25,11 +25,18 @@ def run_migrations():
         ("training_experiments", "current_step", "INTEGER"),
         ("extraction_jobs", "base_url", "VARCHAR(500)"),
         ("extraction_jobs", "api_key", "VARCHAR(500)"),
-        ("extraction_jobs", "task_type", "VARCHAR(50) DEFAULT 'qa_extraction'"),
+        ("extraction_jobs", "task_type", "VARCHAR(50) DEFAULT 'case_extract'"),
         ("extraction_jobs", "assistant_id", "INTEGER"),
+        # Phase 1: augmentation lineage
+        ("extraction_jobs", "source_job_id", "INTEGER"),
+        ("extraction_jobs", "augment_strategies", "JSON"),
         ("llm_assistants", "gpu_ids", "JSON"),
         ("llm_assistants", "extra_env_vars", "JSON"),
         ("evaluation_runs", "phase", "VARCHAR(30) DEFAULT 'pending'"),
+        # Phase 1: DatasetItem points at DiagnosticInstance now. Old column
+        # `knowledge_item_id` is left in place for legacy rows but unused;
+        # the new column carries the FK.
+        ("dataset_items", "instance_id", "INTEGER"),
     ]
     with engine.connect() as conn:
         for table, col, col_type in new_columns:

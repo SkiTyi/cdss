@@ -13,8 +13,7 @@ const STATUS_CONFIG = {
 function CreateJobModal({ onClose, onCreated }) {
   const [form, setForm] = useState({
     name: '',
-    task_type: 'qa_extraction',         // qa_extraction | clinical_reasoning_synthesis
-    document_type: 'case_report',
+    task_type: 'case_extract',          // case_extract | guideline_synth | case_reasoning
     llm_mode: 'assistant',              // assistant | manual
     assistant_id: '',
     base_url: '',
@@ -36,34 +35,26 @@ function CreateJobModal({ onClose, onCreated }) {
     assistantsApi.list().then(r => {
       const ready = r.data.filter(a => a.status === 'running')
       setAssistantList(ready)
-      // auto-pick first running assistant if available
       if (ready.length && !form.assistant_id) {
         setForm(f => ({ ...f, assistant_id: String(ready[0].id) }))
       } else if (!ready.length) {
-        // fall back to manual mode if no assistant available
         setForm(f => ({ ...f, llm_mode: 'manual' }))
       }
     }).catch(() => setForm(f => ({ ...f, llm_mode: 'manual' })))
   }, [])
 
-  const isReasoning = form.task_type === 'clinical_reasoning_synthesis'
   const useAssistant = form.llm_mode === 'assistant'
 
-  // 当前文档类型下可用的文档条数（来自 /documents/stats）
-  const effectiveDocType = isReasoning ? 'case_report' : form.document_type
+  // task_type implies which document type the job will pull from.
+  const docTypeForTask = form.task_type === 'guideline_synth' ? 'guideline' : 'case_report'
   const availableDocs = docStats == null ? null
-    : effectiveDocType === 'case_report' ? docStats.case_reports
-    : effectiveDocType === 'guideline' ? docStats.guidelines
-    : docStats.total
+    : docTypeForTask === 'guideline' ? docStats.guidelines : docStats.case_reports
 
-  // base_url 是否指向本地服务
   const isLocal = /(localhost|127\.0\.0\.1|0\.0\.0\.0|::1)/i.test(form.base_url)
   const needKey = !useAssistant && form.base_url.trim() && !isLocal && !form.api_key.trim()
 
-  // Pick the right default template key based on task type + doc type
-  const defaultTemplateKey = isReasoning
-    ? 'clinical_reasoning'
-    : (form.document_type === 'guideline' ? 'guideline' : 'case_report')
+  // Default-template key matches the backend prompts dict.
+  const defaultTemplateKey = form.task_type
 
   const handleSubmit = async () => {
     setErr('')
@@ -75,7 +66,6 @@ function CreateJobModal({ onClose, onCreated }) {
       const payload = {
         name: form.name,
         task_type: form.task_type,
-        document_type: isReasoning ? 'case_report' : form.document_type,
         prompt_template: form.prompt_template || undefined,
         doc_limit: form.doc_limit ? parseInt(form.doc_limit) : undefined,
       }
@@ -109,51 +99,37 @@ function CreateJobModal({ onClose, onCreated }) {
           {/* Task type selector */}
           <div>
             <label className="text-xs text-slate-500 mb-1 block">任务类型 *</label>
-            <div className="grid grid-cols-2 gap-2">
+            <div className="space-y-2">
               {[
-                ['qa_extraction', '问答对抽取',
-                  '从病例/指南中抽取结构化医学知识与 QA 对（适合通用医学问答数据集）'],
-                ['clinical_reasoning_synthesis', '临床推理诊断合成',
-                  '基于真实病例合成脱敏的、含推理链的多场景训练样本（仅作用于病例报告）'],
-              ].map(([k, label, desc]) => (
+                ['case_extract', '病例 → QA 抽取', 'case_report',
+                  '从临床病例报告中抽取 (问题, 答案) 训练实例。Phase 1 暂沿用旧 prompt；Step 1.2 会换成"完整病例 → 诊断+推理链"的形态'],
+                ['guideline_synth', '指南 → QA 合成', 'guideline',
+                  '从临床指南中提取 QA。Step 1.2 会扩展为"指南 → N 个虚拟患者就诊场景"（产出密度提升一个数量级）'],
+                ['case_reasoning', '病例推理合成', 'case_report',
+                  '基于真实病例合成脱敏 + 含推理链的多场景训练样本（每篇产 2~4 条 instance）'],
+              ].map(([k, label, srcType, desc]) => (
                 <label key={k}
                   className={`flex items-start gap-2 p-3 rounded-lg border cursor-pointer transition-colors
                     ${form.task_type === k ? 'border-blue-400 bg-blue-50' : 'border-slate-200 hover:bg-slate-50'}`}>
                   <input type="radio" name="task_type" className="mt-0.5 accent-blue-600"
                     checked={form.task_type === k}
                     onChange={() => setForm(f => ({ ...f, task_type: k, prompt_template: '' }))} />
-                  <div className="min-w-0">
-                    <p className="text-sm font-medium text-slate-700">{label}</p>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-medium text-slate-700 flex items-center gap-2">
+                      {label}
+                      <span className="text-[11px] font-normal text-slate-400">
+                        源：{srcType === 'guideline' ? '指南' : '病例报告'}
+                      </span>
+                    </p>
                     <p className="text-xs text-slate-400 mt-0.5 leading-relaxed">{desc}</p>
                   </div>
                 </label>
               ))}
             </div>
-          </div>
-
-          <div>
-            <label className="text-xs text-slate-500 mb-1 block">
-              文档类型
-              {isReasoning && <span className="ml-1 text-amber-600">（推理合成模式仅支持病例报告）</span>}
-            </label>
-            <select className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none disabled:bg-slate-50 disabled:text-slate-400"
-              value={isReasoning ? 'case_report' : form.document_type}
-              disabled={isReasoning}
-              onChange={e => setForm(f => ({ ...f, document_type: e.target.value, prompt_template: '' }))}>
-              <option value="case_report">
-                临床病例报告{docStats ? `（可用 ${docStats.case_reports} 条）` : ''}
-              </option>
-              <option value="guideline">
-                临床指南/共识{docStats ? `（可用 ${docStats.guidelines} 条）` : ''}
-              </option>
-              <option value="all">
-                全部{docStats ? `（可用 ${docStats.total} 条）` : ''}
-              </option>
-            </select>
             {docStats != null && (
-              <p className={`mt-1.5 text-xs flex items-center gap-1 ${availableDocs > 0 ? 'text-slate-500' : 'text-red-500'}`}>
-                <span>当前可用文档：<b className={availableDocs > 0 ? 'text-slate-700' : 'text-red-600'}>{availableDocs}</b> 条</span>
-                {availableDocs === 0 && <span>· 请先到「文档管理」加载或调整过滤</span>}
+              <p className={`mt-2 text-xs flex items-center gap-1 ${availableDocs > 0 ? 'text-slate-500' : 'text-red-500'}`}>
+                <span>当前可用源文档：<b className={availableDocs > 0 ? 'text-slate-700' : 'text-red-600'}>{availableDocs}</b> 条</span>
+                {availableDocs === 0 && <span>· 请先到「文档管理」加载</span>}
                 {availableDocs > 0 && form.doc_limit && parseInt(form.doc_limit) < availableDocs && (
                   <span className="text-amber-600">· 本次将仅处理前 {form.doc_limit} 条</span>
                 )}
@@ -172,7 +148,7 @@ function CreateJobModal({ onClose, onCreated }) {
               className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
               value={form.doc_limit}
               onChange={e => setForm(f => ({ ...f, doc_limit: e.target.value }))}
-              placeholder={isReasoning ? '推理合成耗时较长，建议先设 10~30 条试跑' : '例：100（测试时建议先设置小数量）'}
+              placeholder={form.task_type === 'case_reasoning' ? '推理合成耗时较长，建议先设 10~30 条试跑' : '例：100（测试时建议先设置小数量）'}
             />
           </div>
 
@@ -253,7 +229,7 @@ function CreateJobModal({ onClose, onCreated }) {
           <div className="border-t border-slate-100 pt-3">
             <div className="flex items-center justify-between mb-1">
               <label className="text-xs text-slate-500">
-                提示词模板（留空使用默认 · 当前默认：{isReasoning ? '临床推理合成' : (form.document_type === 'guideline' ? '指南' : '病例')}）
+                提示词模板（留空使用默认 · 当前默认：{({case_extract:'病例抽取', guideline_synth:'指南抽取', case_reasoning:'临床推理合成'})[form.task_type]}）
               </label>
               <button className="text-xs text-blue-600 hover:underline"
                 onClick={() => setForm(f => ({ ...f, prompt_template: defaults[defaultTemplateKey] || '' }))}>
@@ -280,31 +256,27 @@ function CreateJobModal({ onClose, onCreated }) {
   )
 }
 
-const KTYPE_LABEL = {
-  qa_pair:            { label: '问答对',     cls: 'bg-purple-100 text-purple-700' },
-  case_analysis:      { label: '病例结构',   cls: 'bg-sky-100 text-sky-700' },
-  guideline_summary:  { label: '指南摘要',   cls: 'bg-teal-100 text-teal-700' },
-  clinical_reasoning: { label: '临床推理',   cls: 'bg-rose-100 text-rose-700' },
+const STRATEGY_LABEL = {
+  case_direct:      { label: '病例直出',       cls: 'bg-sky-100 text-sky-700' },
+  guideline_synth:  { label: '指南合成',       cls: 'bg-teal-100 text-teal-700' },
+  aug_paraphrase:   { label: '改写增强',       cls: 'bg-purple-100 text-purple-700' },
+  aug_distractor:   { label: '干扰注入',       cls: 'bg-orange-100 text-orange-700' },
+  aug_hardneg:      { label: '困难负样本',     cls: 'bg-rose-100 text-rose-700' },
+  aug_cot:          { label: 'CoT 扩写',       cls: 'bg-indigo-100 text-indigo-700' },
+  aug_comorbidity:  { label: '合并症叠加',     cls: 'bg-amber-100 text-amber-700' },
 }
 
-const SCENARIO_LABEL = {
-  diagnosis_reasoning:    '诊断推理',
-  differential_diagnosis: '鉴别诊断',
-  treatment_planning:     '治疗规划',
-  examination_decision:   '检查决策',
-}
-
-function KnowledgePanel({ jobId }) {
+function InstancesPanel({ jobId }) {
   const [data, setData] = useState({ items: [], total: 0 })
   const [page, setPage] = useState(1)
   const [expanded, setExpanded] = useState({})
 
   useEffect(() => {
-    extraction.listKnowledge({ job_id: jobId, page, page_size: 10 }).then(r => setData(r.data))
+    extraction.listInstances({ job_id: jobId, page, page_size: 10 }).then(r => setData(r.data))
   }, [jobId, page])
 
   const toggleApprove = async (item) => {
-    await extraction.approveItem(item.id)
+    await extraction.approveInstance(item.id)
     setData(d => ({
       ...d,
       items: d.items.map(i => i.id === item.id ? { ...i, is_approved: !i.is_approved } : i)
@@ -313,70 +285,55 @@ function KnowledgePanel({ jobId }) {
 
   const toggleExpand = (id) => setExpanded(e => ({ ...e, [id]: !e[id] }))
 
-  const renderContent = (item) => {
-    const c = item.content
-    if (!c || typeof c !== 'object') return String(c ?? '')
-    const isOpen = expanded[item.id]
-    const truncate = (s, n = 200) =>
-      typeof s === 'string' && s.length > n && !isOpen ? s.slice(0, n) + '…' : s
-
-    // QA pair / clinical reasoning — both have question + answer
-    if (c.question && c.answer) {
-      return (
-        <div className="space-y-1.5">
-          {c.scenario_type && (
-            <span className="inline-block px-1.5 py-0.5 bg-rose-50 text-rose-700 rounded text-[10px] font-medium">
-              {SCENARIO_LABEL[c.scenario_type] || c.scenario_type}
-            </span>
-          )}
-          <div>
-            <span className="text-slate-400 text-[11px] mr-1">Q:</span>
-            <span className="text-slate-700">{truncate(c.question, 250)}</span>
-          </div>
-          <div>
-            <span className="text-slate-400 text-[11px] mr-1">A:</span>
-            <span className="text-slate-700 whitespace-pre-wrap">{truncate(c.answer, 350)}</span>
-          </div>
-          {((c.question?.length > 250) || (c.answer?.length > 350)) && (
-            <button onClick={() => toggleExpand(item.id)}
-              className="text-[11px] text-blue-600 hover:underline">
-              {isOpen ? '收起' : '展开全部'}
-            </button>
-          )}
-        </div>
-      )
-    }
-    // Fallback (case_analysis, guideline_summary, etc.)
-    const text = JSON.stringify(c, null, 2)
-    return (
-      <pre className="whitespace-pre-wrap text-slate-600 font-sans">
-        {isOpen ? text : text.slice(0, 400) + (text.length > 400 ? '…' : '')}
-        {text.length > 400 && (
-          <button onClick={() => toggleExpand(item.id)}
-            className="block mt-1 text-[11px] text-blue-600 hover:underline">
-            {isOpen ? '收起' : '展开全部'}
-          </button>
-        )}
-      </pre>
-    )
-  }
+  const truncate = (s, n, open) =>
+    typeof s === 'string' && s.length > n && !open ? s.slice(0, n) + '…' : s
 
   return (
     <div className="mt-4 border-t border-slate-100 pt-4">
-      <p className="text-xs text-slate-500 mb-2">知识条目（共 {data.total} 条）</p>
+      <p className="text-xs text-slate-500 mb-2">诊断实例（共 {data.total} 条）</p>
       <div className="space-y-2 max-h-96 overflow-y-auto">
         {data.items.map(item => {
-          const meta = KTYPE_LABEL[item.knowledge_type] || { label: item.knowledge_type, cls: 'bg-slate-100 text-slate-600' }
+          const meta = STRATEGY_LABEL[item.synthesis_strategy]
+            || { label: item.synthesis_strategy || '?', cls: 'bg-slate-100 text-slate-600' }
+          const isOpen = expanded[item.id]
           return (
             <div key={item.id} className="p-3 bg-slate-50 rounded-lg text-xs">
-              <div className="flex items-center justify-between mb-1.5">
-                <span className={`px-1.5 py-0.5 rounded text-xs font-medium ${meta.cls}`}>{meta.label}</span>
+              <div className="flex items-center justify-between mb-1.5 flex-wrap gap-1">
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <span className={`px-1.5 py-0.5 rounded text-xs font-medium ${meta.cls}`}>{meta.label}</span>
+                  {item.diagnosis_label && (
+                    <span className="px-1.5 py-0.5 bg-slate-200 text-slate-700 rounded text-[10px]">
+                      {item.diagnosis_label}
+                    </span>
+                  )}
+                  {item.specialty && (
+                    <span className="text-[10px] text-slate-400">{item.specialty}</span>
+                  )}
+                  {item.parent_instance_id && (
+                    <span className="text-[10px] text-slate-400">← #{item.parent_instance_id}</span>
+                  )}
+                </div>
                 <button onClick={() => toggleApprove(item)}
                   className={`text-xs ${item.is_approved ? 'text-green-600 font-medium' : 'text-slate-400'} hover:text-green-600`}>
                   {item.is_approved ? '✓ 已审核' : '审核'}
                 </button>
               </div>
-              {renderContent(item)}
+              <div className="space-y-1.5">
+                <div>
+                  <span className="text-slate-400 text-[11px] mr-1">presentation:</span>
+                  <span className="text-slate-700 whitespace-pre-wrap">{truncate(item.presentation, 280, isOpen)}</span>
+                </div>
+                <div>
+                  <span className="text-slate-400 text-[11px] mr-1">answer:</span>
+                  <span className="text-slate-700 whitespace-pre-wrap">{truncate(item.answer, 400, isOpen)}</span>
+                </div>
+                {((item.presentation?.length || 0) > 280 || (item.answer?.length || 0) > 400) && (
+                  <button onClick={() => toggleExpand(item.id)}
+                    className="text-[11px] text-blue-600 hover:underline">
+                    {isOpen ? '收起' : '展开全部'}
+                  </button>
+                )}
+              </div>
             </div>
           )
         })}
@@ -441,9 +398,14 @@ function JobCard({ job, onRefresh }) {
             <span className={`flex items-center gap-1 px-2 py-0.5 rounded text-xs shrink-0 ${cfg.color}`}>
               <Icon size={10} /> {cfg.label}
             </span>
-            {job.task_type === 'clinical_reasoning_synthesis' && (
+            {job.task_type === 'case_reasoning' && (
               <span className="px-2 py-0.5 bg-rose-100 text-rose-700 rounded text-xs shrink-0">
                 临床推理合成
+              </span>
+            )}
+            {job.task_type === 'guideline_synth' && (
+              <span className="px-2 py-0.5 bg-teal-100 text-teal-700 rounded text-xs shrink-0">
+                指南合成
               </span>
             )}
           </div>
@@ -518,7 +480,7 @@ function JobCard({ job, onRefresh }) {
         </div>
       </div>
 
-      {expanded && <KnowledgePanel jobId={job.id} />}
+      {expanded && <InstancesPanel jobId={job.id} />}
     </div>
   )
 }

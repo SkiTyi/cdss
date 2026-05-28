@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from typing import Optional, List
 from pydantic import BaseModel
 from ..database import get_db
-from ..models.models import Dataset, DatasetItem, KnowledgeItem
+from ..models.models import Dataset, DatasetItem, DiagnosticInstance
 
 router = APIRouter(prefix="/datasets", tags=["datasets"])
 
@@ -15,8 +15,10 @@ class CreateDatasetRequest(BaseModel):
     name: str
     description: Optional[str] = None
     format: str = "alpaca"
-    knowledge_item_ids: Optional[List[int]] = None
-    job_id: Optional[int] = None
+    # Source selection — pick one:
+    instance_ids: Optional[List[int]] = None    # explicit set
+    job_id: Optional[int] = None                # all instances from a job
+    approved_only: bool = False                 # restrict to is_approved=True
     system_prompt: Optional[str] = "你是一位专业的临床医学助手，请根据患者的病情描述给出专业的诊断分析和治疗建议。"
 
 
@@ -41,29 +43,26 @@ def create_dataset(req: CreateDatasetRequest, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(dataset)
 
-    # collect knowledge items — supports both QA pairs and clinical reasoning samples.
-    # Both store content as {"question": ..., "answer": ..., ...}, so they share the
-    # same conversion path; we just widen the knowledge_type filter.
-    q = db.query(KnowledgeItem).filter(
-        KnowledgeItem.knowledge_type.in_(("qa_pair", "clinical_reasoning"))
-    )
-    if req.knowledge_item_ids:
-        q = q.filter(KnowledgeItem.id.in_(req.knowledge_item_ids))
+    # Pull instances. Phase 1: one DiagnosticInstance ↔ one DatasetItem.
+    q = db.query(DiagnosticInstance)
+    if req.instance_ids:
+        q = q.filter(DiagnosticInstance.id.in_(req.instance_ids))
     elif req.job_id:
-        q = q.filter(KnowledgeItem.job_id == req.job_id)
+        q = q.filter(DiagnosticInstance.job_id == req.job_id)
+    if req.approved_only:
+        q = q.filter(DiagnosticInstance.is_approved == True)
 
     items = q.all()
     count = 0
-    for ki in items:
-        content = ki.content or {}
-        question = content.get("question", "")
-        answer = content.get("answer", "")
-        if not question or not answer:
+    for inst in items:
+        presentation = (inst.presentation or "").strip()
+        answer = (inst.answer or "").strip()
+        if not presentation or not answer:
             continue
         di = DatasetItem(
             dataset_id=dataset.id,
-            knowledge_item_id=ki.id,
-            instruction=question,
+            instance_id=inst.id,
+            instruction=presentation,
             input="",
             output=answer,
             system_prompt=req.system_prompt,
@@ -94,7 +93,9 @@ def list_items(dataset_id: int, page: int = 1, page_size: int = 20, db: Session 
     return {
         "total": total, "page": page, "page_size": page_size,
         "items": [
-            {"id": i.id, "instruction": i.instruction, "input": i.input, "output": i.output, "system_prompt": i.system_prompt}
+            {"id": i.id, "instruction": i.instruction, "input": i.input,
+             "output": i.output, "system_prompt": i.system_prompt,
+             "instance_id": i.instance_id}
             for i in items
         ],
     }
@@ -139,17 +140,13 @@ def delete_dataset(dataset_id: int, db: Session = Depends(get_db)):
 class SplitDatasetRequest(BaseModel):
     name: str
     description: Optional[str] = None
-    sample_size: Optional[int] = None    # take exactly N items
-    ratio: Optional[float] = None        # OR take this fraction (0 < r <= 1)
-    seed: Optional[int] = None           # reproducible split
+    sample_size: Optional[int] = None
+    ratio: Optional[float] = None
+    seed: Optional[int] = None
 
 
 @router.post("/{dataset_id}/split")
 def split_dataset(dataset_id: int, req: SplitDatasetRequest, db: Session = Depends(get_db)):
-    """Randomly subsample an existing dataset into a new (smaller) dataset.
-
-    Useful for spinning up a quick eval set without rebuilding from knowledge items.
-    """
     src = db.query(Dataset).filter(Dataset.id == dataset_id).first()
     if not src:
         raise HTTPException(404, "源数据集不存在")
@@ -157,7 +154,6 @@ def split_dataset(dataset_id: int, req: SplitDatasetRequest, db: Session = Depen
     if not items:
         raise HTTPException(400, "源数据集没有条目，无法切分")
 
-    # Resolve target size
     if req.sample_size is not None and req.sample_size > 0:
         n = min(int(req.sample_size), len(items))
     elif req.ratio is not None and 0 < req.ratio <= 1:
@@ -183,7 +179,7 @@ def split_dataset(dataset_id: int, req: SplitDatasetRequest, db: Session = Depen
     for it in picked:
         db.add(DatasetItem(
             dataset_id=new_ds.id,
-            knowledge_item_id=it.knowledge_item_id,
+            instance_id=it.instance_id,
             instruction=it.instruction,
             input=it.input,
             output=it.output,

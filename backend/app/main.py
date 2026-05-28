@@ -33,13 +33,13 @@ app.include_router(pretraining.router, prefix="/api")
 @app.get("/api/stats")
 def global_stats():
     from .database import SessionLocal
-    from .models.models import Document, ExtractionJob, KnowledgeItem, Dataset, TrainingExperiment
+    from .models.models import Document, ExtractionJob, DiagnosticInstance, Dataset, TrainingExperiment
     db = SessionLocal()
     try:
         return {
             "documents": db.query(Document).count(),
             "extraction_jobs": db.query(ExtractionJob).count(),
-            "knowledge_items": db.query(KnowledgeItem).count(),
+            "diagnostic_instances": db.query(DiagnosticInstance).count(),
             "datasets": db.query(Dataset).count(),
             "experiments": db.query(TrainingExperiment).count(),
         }

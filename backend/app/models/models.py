@@ -16,7 +16,7 @@ class Document(Base):
     status = Column(String(50), default="pending")  # pending | extracted
     created_at = Column(DateTime, default=datetime.utcnow)
 
-    knowledge_items = relationship("KnowledgeItem", back_populates="document")
+    instances = relationship("DiagnosticInstance", back_populates="source_doc")
 
 
 class ExtractionJob(Base):
@@ -25,8 +25,11 @@ class ExtractionJob(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(200))
     document_type = Column(String(50))  # case_report | guideline | all
-    # qa_extraction (default, original) | clinical_reasoning_synthesis (de-identified diagnostic reasoning samples)
-    task_type = Column(String(50), default="qa_extraction")
+    # Phase 1 task types:
+    #   case_extract     — extract DiagnosticInstance(s) from a case report (Q→A from full case)
+    #   guideline_synth  — synthesize N virtual-patient DiagnosticInstances from a guideline doc
+    #   augment          — produce variants from an existing job's instances (paraphrase / distractor / hardneg / ...)
+    task_type = Column(String(50), default="case_extract")
     prompt_template = Column(Text)
     model = Column(String(100))
     base_url = Column(String(500), nullable=True)     # LLM API base url override
@@ -36,7 +39,11 @@ class ExtractionJob(Base):
     # base_url/model/api_key fields above are ignored.
     assistant_id = Column(Integer, ForeignKey("llm_assistants.id"), nullable=True)
     doc_limit = Column(Integer, nullable=True)       # 限制处理文档数量，None 表示全部
-    is_cancelled = Column(Boolean, default=False)     # 取消/暂停标志
+    # For task_type='augment': which upstream job's instances to operate on,
+    # and which augmentation strategies to apply (list of strategy names).
+    source_job_id = Column(Integer, ForeignKey("extraction_jobs.id"), nullable=True)
+    augment_strategies = Column(JSON, nullable=True)
+    is_cancelled = Column(Boolean, default=False)
     status = Column(String(50), default="pending")  # pending | running | paused | completed | failed | cancelled
     total_docs = Column(Integer, default=0)
     processed_docs = Column(Integer, default=0)
@@ -46,24 +53,56 @@ class ExtractionJob(Base):
     completed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-    knowledge_items = relationship("KnowledgeItem", back_populates="job")
+    instances = relationship("DiagnosticInstance", back_populates="job",
+                             foreign_keys="DiagnosticInstance.job_id")
 
 
-class KnowledgeItem(Base):
-    __tablename__ = "knowledge_items"
+class DiagnosticInstance(Base):
+    """A single (presentation → answer) training-shaped sample.
+
+    This is the *only* unit knowledge is stored in. Anything that doesn't fit
+    this shape — entities, relations, summaries, declarative facts — should
+    be transformed into this shape before persisting. Justification: the
+    downstream task (and the test set) is single-turn diagnostic
+    `(presentation) → (answer)`, so the storage format mirrors training
+    samples 1:1 instead of going through an intermediate human-readable
+    representation.
+
+    Created in three ways:
+      * case_extract     — one or more from a case report
+      * guideline_synth  — virtual patients constructed from a guideline
+      * augment          — variants of an existing instance (paraphrase /
+                           distractor injection / hard-negative / cot enrich)
+    """
+    __tablename__ = "diagnostic_instances"
 
     id = Column(Integer, primary_key=True, index=True)
+    # Training fields (the model sees these)
+    presentation = Column(Text)             # full clinical scenario
+    answer = Column(Text)                   # diagnosis + reasoning (CoT)
+
+    # Metadata used ONLY for sampling, balancing, analytics — not for training
+    diagnosis_label = Column(String(200), index=True)  # normalized (lowercased, stripped) primary diagnosis
+    specialty = Column(String(100), nullable=True)
+    difficulty = Column(Float, nullable=True)           # 0~1; populated by Step 1.3 LLM judge
+
+    # Lineage
+    synthesis_strategy = Column(String(50))             # case_direct | guideline_synth | aug_paraphrase | aug_distractor | aug_hardneg | aug_cot | aug_comorbidity
+    parent_instance_id = Column(Integer, ForeignKey("diagnostic_instances.id"), nullable=True)
+    source_doc_id = Column(Integer, ForeignKey("documents.id"), nullable=True)
     job_id = Column(Integer, ForeignKey("extraction_jobs.id"), nullable=True)
-    document_id = Column(Integer, ForeignKey("documents.id"), nullable=True)
-    knowledge_type = Column(String(100))  # qa_pair | clinical_reasoning | diagnostic_criteria | treatment_protocol
-    content = Column(JSON)
+
+    # Curation
     quality_score = Column(Float, nullable=True)
     is_approved = Column(Boolean, default=False)
+
     created_at = Column(DateTime, default=datetime.utcnow)
 
-    job = relationship("ExtractionJob", back_populates="knowledge_items")
-    document = relationship("Document", back_populates="knowledge_items")
-    dataset_items = relationship("DatasetItem", back_populates="knowledge_item")
+    source_doc = relationship("Document", back_populates="instances")
+    job = relationship("ExtractionJob", back_populates="instances",
+                       foreign_keys=[job_id])
+    parent = relationship("DiagnosticInstance", remote_side=[id])
+    dataset_items = relationship("DatasetItem", back_populates="instance")
 
 
 class Dataset(Base):
@@ -86,7 +125,7 @@ class DatasetItem(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     dataset_id = Column(Integer, ForeignKey("datasets.id"))
-    knowledge_item_id = Column(Integer, ForeignKey("knowledge_items.id"), nullable=True)
+    instance_id = Column(Integer, ForeignKey("diagnostic_instances.id"), nullable=True)
     instruction = Column(Text)
     input = Column(Text, default="")
     output = Column(Text)
@@ -94,7 +133,7 @@ class DatasetItem(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     dataset = relationship("Dataset", back_populates="items")
-    knowledge_item = relationship("KnowledgeItem", back_populates="dataset_items")
+    instance = relationship("DiagnosticInstance", back_populates="dataset_items")
 
 
 class TrainingExperiment(Base):

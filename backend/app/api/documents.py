@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from typing import Optional, List
 from pydantic import BaseModel
 from ..database import get_db
-from ..models.models import Document, KnowledgeItem
+from ..models.models import Document, DiagnosticInstance
 from ..services.data_loader import load_cases, load_guidelines
 
 router = APIRouter(prefix="/documents", tags=["documents"])
@@ -21,17 +21,17 @@ def _serialize(d: Document):
 
 
 def _detach_knowledge_refs(db: Session, doc_ids: List[int]):
-    """NULL out knowledge_items.document_id for soon-to-be-deleted documents.
+    """NULL out diagnostic_instances.source_doc_id for soon-to-be-deleted documents.
 
-    SQLite doesn't enforce FKs by default, but leaving dangling document_id
-    values makes later joins surprising. Knowledge items themselves are kept
+    SQLite doesn't enforce FKs by default, but leaving dangling source_doc_id
+    values makes later joins surprising. The instances themselves are kept
     — they remain valid for dataset construction even after their source
     document is removed.
     """
     if not doc_ids:
         return
-    db.query(KnowledgeItem).filter(KnowledgeItem.document_id.in_(doc_ids)).update(
-        {KnowledgeItem.document_id: None}, synchronize_session=False
+    db.query(DiagnosticInstance).filter(DiagnosticInstance.source_doc_id.in_(doc_ids)).update(
+        {DiagnosticInstance.source_doc_id: None}, synchronize_session=False
     )
 
 
@@ -141,8 +141,8 @@ def delete_short(req: DeleteShortRequest, db: Session = Depends(get_db)):
 def reset_documents(db: Session = Depends(get_db)):
     """Wipe the entire documents table. Files on disk are not touched —
     POST /documents/load rebuilds everything."""
-    db.query(KnowledgeItem).update(
-        {KnowledgeItem.document_id: None}, synchronize_session=False
+    db.query(DiagnosticInstance).update(
+        {DiagnosticInstance.source_doc_id: None}, synchronize_session=False
     )
     deleted = db.query(Document).delete(synchronize_session=False)
     db.commit()

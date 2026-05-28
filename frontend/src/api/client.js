@@ -24,9 +24,10 @@ export const extraction = {
   cancelJob: (id) => api.post(`/extraction/jobs/${id}/cancel`),
   restartJob: (id) => api.post(`/extraction/jobs/${id}/restart`),
   deleteJob: (id) => api.delete(`/extraction/jobs/${id}`),
-  listKnowledge: (params) => api.get('/extraction/knowledge', { params }),
-  approveItem: (id) => api.patch(`/extraction/knowledge/${id}/approve`),
+  listInstances: (params) => api.get('/extraction/instances', { params }),
+  approveInstance: (id) => api.patch(`/extraction/instances/${id}/approve`),
   stats: () => api.get('/extraction/stats'),
+  diagnosisDistribution: (top = 30) => api.get('/extraction/diagnosis-distribution', { params: { top } }),
   defaultPrompts: () => api.get('/extraction/prompts/defaults'),
 }
 

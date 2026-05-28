@@ -1,9 +1,25 @@
+"""Knowledge extraction runner.
+
+Phase 1 (Step 1.1): unified output to DiagnosticInstance.
+
+Three task types map to upstream document types:
+  * case_extract     — case report → 1 instance per generated QA / reasoning sample
+  * guideline_synth  — guideline doc → 1 instance per generated QA pair
+                       (Step 1.2 will replace this with N-virtual-patient synthesis)
+  * case_reasoning   — case report → 1 instance per clinical-reasoning scenario sample
+
+Prompts here are placeholder versions kept from before the refactor — Step 1.2
+will rewrite them to produce presentation/answer pairs natively. For now we
+adapt their output into the DiagnosticInstance shape.
+"""
 import json
+import re
 import httpx
 from sqlalchemy.orm import Session
-from ..models.models import ExtractionJob, KnowledgeItem, Document
+from ..models.models import ExtractionJob, DiagnosticInstance, Document
 from ..config import settings
 from datetime import datetime
+
 
 CASE_PROMPT = """你是一位医学知识提取专家。请从以下临床病例报告中提取结构化医学知识，以JSON格式返回。
 
@@ -68,6 +84,7 @@ CLINICAL_REASONING_PROMPT = """你是一位资深临床医师与医学AI数据�
 【输出 JSON 严格格式（不要输出任何其他文字、不要 Markdown 代码块）】
 {{
   "case_summary": "对该病例的一句话脱敏总结（疾病/关键体征/治疗结局），≤80字",
+  "primary_diagnosis": "该病例最主要的诊断（具体疾病名称）",
   "training_samples": [
     {{
       "scenario_type": "diagnosis_reasoning",
@@ -83,11 +100,6 @@ CLINICAL_REASONING_PROMPT = """你是一位资深临床医师与医学AI数据�
       "scenario_type": "treatment_planning",
       "question": "已确诊为[具体疾病名]的患者（脱敏简述病情、合并症、过敏史、关键化验值），请给出个体化治疗方案。",
       "answer": "1. 一线治疗：药物名/剂量范围/用法（避免极端精确剂量，可写常用剂量区间）\\n2. 合并症与禁忌处理\\n3. 监测与随访指标\\n4. 健康教育与生活方式建议\\n5. 预后与复查计划"
-    }},
-    {{
-      "scenario_type": "examination_decision",
-      "question": "面对该患者目前的临床表现（脱敏），需要做哪些进一步辅助检查以明确诊断？请说明优先级与目的。",
-      "answer": "按优先级列出：检查项目 → 目的 → 预期结果 → 对决策的影响。覆盖至少 3 项。"
     }}
   ]
 }}
@@ -95,10 +107,12 @@ CLINICAL_REASONING_PROMPT = """你是一位资深临床医师与医学AI数据�
 【硬性质量要求】
 A. 每条 question 都必须是独立可理解的完整临床场景，不能出现"如上"、"该患者"在没有上下文时单独使用。
 B. 答案必须基于原病例事实推理，不要捏造原文未提及的检查值或既往史。
-C. 推理链必须显式列出"依据→结论"的因果关系，鼓励出现"考虑/支持/不支持/需鉴别"等临床思维表达。
-D. 至少生成 2 条样本，最多 4 条；如果原病例信息不足以支持某 scenario_type，可省略该条而非编造。
+C. 推理链必须显式列出"依据→结论"的因果关系。
+D. 至少生成 2 条样本，最多 4 条；信息不足以支持某 scenario_type 时可省略而非编造。
 E. 严格符合 JSON 语法，所有字符串使用双引号；不要在 JSON 外输出任何文字。"""
 
+
+# ─────────────────────────── helpers ──────────────────────────────────────
 
 def _is_local_endpoint(url: str) -> bool:
     if not url:
@@ -106,10 +120,26 @@ def _is_local_endpoint(url: str) -> bool:
     return any(h in url for h in ("localhost", "127.0.0.1", "0.0.0.0", "::1"))
 
 
+def _normalize_label(s: str) -> str:
+    """Lowercase + strip whitespace/punctuation for diagnosis_label.
+
+    Used as a sampling key only. Different surface forms ("急性心梗" vs
+    "急性心肌梗死") will NOT be unified by this function — Step 1.2 will add
+    LLM-based canonicalization. For now we just collapse whitespace and
+    strip trailing periods/quotes so that "急性心梗。" and " 急性心梗" go to
+    the same bucket.
+    """
+    if not s:
+        return ""
+    s = str(s).strip().lower()
+    s = re.sub(r"\s+", "", s)
+    s = s.strip(".。'\"`,，;；:：")
+    return s[:200]
+
+
 def _call_llm(prompt: str, model: str, base_url: str, api_key: str,
               max_tokens: int = 2000) -> dict:
     headers = {"Content-Type": "application/json"}
-    # Local endpoints (e.g. ollama, vllm) typically don't require auth.
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     payload = {
@@ -123,48 +153,78 @@ def _call_llm(prompt: str, model: str, base_url: str, api_key: str,
                            headers=headers, json=payload)
         resp.raise_for_status()
     text = resp.json()["choices"][0]["message"]["content"].strip()
-    # strip markdown code fences if present
     if text.startswith("```"):
         text = text.split("```")[1]
         if text.startswith("json"):
             text = text[4:]
-        # clean trailing fence
         text = text.rsplit("```", 1)[0].strip()
     return json.loads(text)
 
 
-def _process_qa_extraction(doc, prompt_template, job, model_name, base_url, api_key, db):
-    """Original behavior: extract structured medical knowledge + qa_pairs."""
-    template = prompt_template or (
-        CASE_PROMPT if doc.type == "case_report" else GUIDELINE_PROMPT
-    )
+# ─────────────────────────── per-doc processors ───────────────────────────
+
+def _process_case_extract(doc, prompt_template, job, model_name, base_url, api_key, db):
+    template = prompt_template or CASE_PROMPT
     content = (doc.content or "")[:3000]
     prompt = template.replace("{content}", content)
     extracted = _call_llm(prompt, model_name, base_url, api_key)
 
-    qa_pairs = extracted.pop("qa_pairs", [])
+    diagnosis_label = _normalize_label(extracted.get("diagnosis", ""))
+    specialty = (doc.doc_metadata or {}).get("specialty") if doc.doc_metadata else None
+
+    qa_pairs = extracted.get("qa_pairs", []) or []
+    saved = 0
     for qa in qa_pairs:
-        db.add(KnowledgeItem(
+        q = (qa.get("question") or "").strip()
+        a = (qa.get("answer") or "").strip()
+        if not q or not a:
+            continue
+        db.add(DiagnosticInstance(
+            presentation=q,
+            answer=a,
+            diagnosis_label=diagnosis_label,
+            specialty=specialty,
+            synthesis_strategy="case_direct",
+            source_doc_id=doc.id,
             job_id=job.id,
-            document_id=doc.id,
-            knowledge_type="qa_pair",
-            content=qa,
         ))
-    # store the structured extraction as well
-    db.add(KnowledgeItem(
-        job_id=job.id,
-        document_id=doc.id,
-        knowledge_type="case_analysis" if doc.type == "case_report" else "guideline_summary",
-        content=extracted,
-    ))
+        saved += 1
+    if saved == 0:
+        raise ValueError("LLM 未返回有效 qa_pairs")
 
 
-def _process_clinical_reasoning(doc, prompt_template, job, model_name, base_url, api_key, db):
-    """Synthesize de-identified clinical reasoning training samples."""
+def _process_guideline_synth(doc, prompt_template, job, model_name, base_url, api_key, db):
+    template = prompt_template or GUIDELINE_PROMPT
+    content = (doc.content or "")[:3000]
+    prompt = template.replace("{content}", content)
+    extracted = _call_llm(prompt, model_name, base_url, api_key)
+
+    diagnosis_label = _normalize_label(extracted.get("disease", ""))
+    specialty = (doc.doc_metadata or {}).get("specialty") if doc.doc_metadata else None
+
+    qa_pairs = extracted.get("qa_pairs", []) or []
+    saved = 0
+    for qa in qa_pairs:
+        q = (qa.get("question") or "").strip()
+        a = (qa.get("answer") or "").strip()
+        if not q or not a:
+            continue
+        db.add(DiagnosticInstance(
+            presentation=q,
+            answer=a,
+            diagnosis_label=diagnosis_label,
+            specialty=specialty,
+            synthesis_strategy="guideline_synth",
+            source_doc_id=doc.id,
+            job_id=job.id,
+        ))
+        saved += 1
+    if saved == 0:
+        raise ValueError("LLM 未返回有效 qa_pairs")
+
+
+def _process_case_reasoning(doc, prompt_template, job, model_name, base_url, api_key, db):
     template = prompt_template or CLINICAL_REASONING_PROMPT
-    # Reasoning synthesis needs the full case body, not just first 3000 chars,
-    # but cap to keep within typical context; also the answer is longer so
-    # we lift max_tokens.
     content = (doc.content or "")[:8000]
     prompt = template.replace("{content}", content)
     extracted = _call_llm(prompt, model_name, base_url, api_key, max_tokens=4000)
@@ -173,24 +233,37 @@ def _process_clinical_reasoning(doc, prompt_template, job, model_name, base_url,
     if not isinstance(samples, list) or not samples:
         raise ValueError("LLM 返回中缺少有效的 training_samples 数组")
 
-    case_summary = extracted.get("case_summary", "")
-    for sample in samples:
-        question = sample.get("question", "").strip()
-        answer = sample.get("answer", "").strip()
-        if not question or not answer:
-            continue
-        db.add(KnowledgeItem(
-            job_id=job.id,
-            document_id=doc.id,
-            knowledge_type="clinical_reasoning",
-            content={
-                "scenario_type": sample.get("scenario_type", "clinical_reasoning"),
-                "question": question,
-                "answer": answer,
-                "case_summary": case_summary,
-            },
-        ))
+    diagnosis_label = _normalize_label(extracted.get("primary_diagnosis", ""))
+    specialty = (doc.doc_metadata or {}).get("specialty") if doc.doc_metadata else None
 
+    saved = 0
+    for sample in samples:
+        q = (sample.get("question") or "").strip()
+        a = (sample.get("answer") or "").strip()
+        if not q or not a:
+            continue
+        db.add(DiagnosticInstance(
+            presentation=q,
+            answer=a,
+            diagnosis_label=diagnosis_label,
+            specialty=specialty,
+            synthesis_strategy="case_direct",
+            source_doc_id=doc.id,
+            job_id=job.id,
+        ))
+        saved += 1
+    if saved == 0:
+        raise ValueError("LLM 未返回任何含 question+answer 的样本")
+
+
+_PROCESSORS = {
+    "case_extract":    _process_case_extract,
+    "guideline_synth": _process_guideline_synth,
+    "case_reasoning":  _process_case_reasoning,
+}
+
+
+# ─────────────────────────── job orchestrator ─────────────────────────────
 
 def run_extraction_job(job_id: int, db: Session):
     job = db.query(ExtractionJob).filter(ExtractionJob.id == job_id).first()
@@ -202,7 +275,6 @@ def run_extraction_job(job_id: int, db: Session):
     db.commit()
 
     # ── resolve LLM parameters ────────────────────────────────────────────
-    # Priority: configured assistant > job-level overrides > global .env
     base_url = ""
     model_name = ""
     api_key = ""
@@ -225,35 +297,32 @@ def run_extraction_job(job_id: int, db: Session):
         api_key = (job.api_key or settings.llm_api_key or "").strip()
 
     if not base_url:
-        job.status = "failed"
-        job.error_message = "未配置 LLM base_url"
-        job.completed_at = datetime.utcnow()
-        db.commit()
+        _fail(db, job, "未配置 LLM base_url")
         return
     if not model_name:
-        job.status = "failed"
-        job.error_message = "未配置 LLM model name"
-        job.completed_at = datetime.utcnow()
-        db.commit()
+        _fail(db, job, "未配置 LLM model name")
         return
     if not api_key and not _is_local_endpoint(base_url):
-        job.status = "failed"
-        job.error_message = "远程 LLM 服务必须提供 api_key（仅 localhost 可省略）"
-        job.completed_at = datetime.utcnow()
-        db.commit()
+        _fail(db, job, "远程 LLM 服务必须提供 api_key（仅 localhost 可省略）")
         return
 
-    task_type = (job.task_type or "qa_extraction").strip()
+    task_type = (job.task_type or "case_extract").strip()
+    processor = _PROCESSORS.get(task_type)
+    if not processor:
+        _fail(db, job, f"未知 task_type: {task_type}")
+        return
 
+    # ── document selection ────────────────────────────────────────────────
     try:
         query = db.query(Document)
-        if task_type == "clinical_reasoning_synthesis":
-            # Reasoning synthesis is meaningful only on case reports.
+        # task_type narrows the document pool to its natural source type.
+        if task_type == "guideline_synth":
+            query = query.filter(Document.type == "guideline")
+        elif task_type in ("case_extract", "case_reasoning"):
             query = query.filter(Document.type == "case_report")
-        elif job.document_type != "all":
+        elif job.document_type and job.document_type != "all":
             query = query.filter(Document.type == job.document_type)
 
-        # 支持限制数量
         if job.doc_limit and job.doc_limit > 0:
             docs = query.limit(job.doc_limit).all()
         else:
@@ -263,7 +332,6 @@ def run_extraction_job(job_id: int, db: Session):
         db.commit()
 
         for doc in docs:
-            # 每次处理前检查是否被取消
             db.refresh(job)
             if job.is_cancelled:
                 job.status = "cancelled"
@@ -272,12 +340,7 @@ def run_extraction_job(job_id: int, db: Session):
                 return
 
             try:
-                if task_type == "clinical_reasoning_synthesis":
-                    _process_clinical_reasoning(
-                        doc, job.prompt_template, job, model_name, base_url, api_key, db)
-                else:
-                    _process_qa_extraction(
-                        doc, job.prompt_template, job, model_name, base_url, api_key, db)
+                processor(doc, job.prompt_template, job, model_name, base_url, api_key, db)
                 doc.status = "extracted"
                 job.processed_docs += 1
             except Exception:
@@ -291,4 +354,11 @@ def run_extraction_job(job_id: int, db: Session):
         job.status = "failed"
         job.error_message = str(e)
 
+    db.commit()
+
+
+def _fail(db, job, msg: str):
+    job.status = "failed"
+    job.error_message = msg
+    job.completed_at = datetime.utcnow()
     db.commit()

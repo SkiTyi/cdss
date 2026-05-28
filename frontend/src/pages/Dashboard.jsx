@@ -55,7 +55,7 @@ export default function Dashboard() {
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
         <StatCard icon={FileText} label="文档总数" value={stats?.documents} color="bg-blue-500" />
-        <StatCard icon={Zap} label="知识条目" value={stats?.knowledge_items} color="bg-purple-500" />
+        <StatCard icon={Zap} label="诊断实例" value={stats?.diagnostic_instances} color="bg-purple-500" />
         <StatCard icon={Database} label="数据集" value={stats?.datasets} color="bg-green-500" />
         <StatCard icon={FlaskConical} label="训练实验" value={stats?.experiments} color="bg-orange-500" />
       </div>
