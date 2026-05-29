@@ -92,10 +92,28 @@ def main():
 
     try:
         from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
-        from trl import SFTTrainer, SFTConfig
     except ImportError as e:
-        emit({"type": "error", "message": f"缺少 PEFT/TRL 库: {e}。请安装: pip install peft trl"})
+        emit({"type": "error", "message": f"缺少 PEFT 库: {e}。请安装: pip install peft"})
         sys.exit(1)
+
+    try:
+        from trl import SFTTrainer
+    except ImportError as e:
+        emit({"type": "error", "message": f"缺少 trl 库: {e}。请安装: pip install trl"})
+        sys.exit(1)
+
+    # ── trl / transformers cross-version compatibility ─────────────────
+    # SFTConfig was introduced in trl >= 0.12. On older trl (V100 hosts
+    # often pinned to transformers ~4.46 because vllm 0.6.2 demands it,
+    # and the matching trl ~0.11.x doesn't ship SFTConfig), fall back to
+    # plain TrainingArguments and pass SFT-specific kwargs to the trainer
+    # itself. Which kwargs are accepted is detected by inspect below.
+    try:
+        from trl import SFTConfig as _ArgsClass
+        _ARGS_HAVE_SFT_FIELDS = True
+    except ImportError:
+        _ArgsClass = TrainingArguments
+        _ARGS_HAVE_SFT_FIELDS = False
 
     # ------------------------------------------------------------------ device
     # LOCAL_RANK / WORLD_SIZE are set by torchrun for DDP; default to 0/1 for single-proc.
@@ -282,40 +300,63 @@ def main():
               "message": f"save_steps={save_steps} 不是 eval_steps={eval_steps} 的整数倍，已自动调整为 {new_save}"})
         save_steps = new_save
 
-    training_args = SFTConfig(
-        output_dir=output_dir,
-        num_train_epochs=num_epochs,
-        per_device_train_batch_size=batch_size,
-        per_device_eval_batch_size=batch_size,
-        gradient_accumulation_steps=grad_accum,
-        learning_rate=lr,
-        weight_decay=weight_decay,
-        warmup_ratio=warmup_ratio,
-        fp16=fp16,
-        bf16=use_bf16,
-        logging_steps=logging_steps,
-        eval_strategy="steps" if eval_dataset else "no",
-        eval_steps=eval_steps if eval_dataset else None,
-        save_strategy="steps",
-        save_steps=save_steps,
-        save_total_limit=3,
-        load_best_model_at_end=eval_dataset is not None,
-        report_to="none",
-        max_length=max_seq_len,          # TRL>=0.26 uses max_length (not max_seq_length)
-        dataset_text_field="text",
-        # In-training eval only needs eval_loss; the post-train token-accuracy
-        # path uses model.forward() directly (outside Trainer) so it gets logits
-        # there. Keeping these flags off saves ~B×T×V×4 bytes of fp32 logits per
-        # eval batch — without them a 7B model + vocab=150K + seq=2048 OOMs on a
-        # 32 GB GPU during evaluation.
-        prediction_loss_only=True,
-        eval_do_concat_batches=False,
-    )
+    # Build training-args kwargs through inspection, so the same script
+    # runs on transformers 4.46 (V100/vllm0.6) and 5.x (5090/vllm-latest)
+    # without two code paths. raw[] enumerates everything we'd LIKE to set;
+    # only kwargs the chosen class actually accepts are kept.
+    import inspect as _inspect
+    _arg_params = _inspect.signature(_ArgsClass.__init__).parameters
 
-    # TRL >= 0.12 renamed `tokenizer` → `processing_class` (matching HF Trainer).
-    # Pick whichever the installed version accepts.
-    import inspect
-    _sft_params = inspect.signature(SFTTrainer.__init__).parameters
+    raw = {
+        "output_dir": output_dir,
+        "num_train_epochs": num_epochs,
+        "per_device_train_batch_size": batch_size,
+        "per_device_eval_batch_size": batch_size,
+        "gradient_accumulation_steps": grad_accum,
+        "learning_rate": lr,
+        "weight_decay": weight_decay,
+        "warmup_ratio": warmup_ratio,
+        "fp16": fp16,
+        "bf16": use_bf16,
+        "logging_steps": logging_steps,
+        "save_strategy": "steps",
+        "save_steps": save_steps,
+        "save_total_limit": 3,
+        "load_best_model_at_end": eval_dataset is not None,
+        "report_to": "none",
+        # In-training eval only needs eval_loss (post-train token accuracy
+        # bypasses Trainer.evaluate). Keeping logits off saves ~B×T×V×4
+        # bytes of fp32 logits per eval batch — without it a 7B + vocab
+        # 150K + seq 2048 OOMs on 32 GB during evaluation.
+        "prediction_loss_only": True,
+    }
+    # eval_strategy was renamed from evaluation_strategy in transformers 4.39+
+    if "eval_strategy" in _arg_params:
+        raw["eval_strategy"] = "steps" if eval_dataset else "no"
+    elif "evaluation_strategy" in _arg_params:
+        raw["evaluation_strategy"] = "steps" if eval_dataset else "no"
+    if eval_dataset is not None:
+        raw["eval_steps"] = eval_steps
+    # eval_do_concat_batches added in transformers 4.40+
+    if "eval_do_concat_batches" in _arg_params:
+        raw["eval_do_concat_batches"] = False
+
+    # SFT-specific knobs live on SFTConfig (new trl). On old trl we fall
+    # back to TrainingArguments — these would crash there, so we route them
+    # to the SFTTrainer constructor instead (see below).
+    if _ARGS_HAVE_SFT_FIELDS:
+        if "max_length" in _arg_params:
+            raw["max_length"] = max_seq_len          # trl >= 0.26
+        elif "max_seq_length" in _arg_params:
+            raw["max_seq_length"] = max_seq_len      # trl 0.12 ~ 0.25
+        if "dataset_text_field" in _arg_params:
+            raw["dataset_text_field"] = "text"
+
+    final_kwargs = {k: v for k, v in raw.items() if k in _arg_params}
+    training_args = _ArgsClass(**final_kwargs)
+
+    # SFTTrainer kwargs — also varies across versions.
+    _sft_params = _inspect.signature(SFTTrainer.__init__).parameters
     trainer_kwargs = {
         "model": model,
         "train_dataset": train_dataset,
@@ -327,6 +368,13 @@ def main():
         trainer_kwargs["processing_class"] = tokenizer
     elif "tokenizer" in _sft_params:
         trainer_kwargs["tokenizer"] = tokenizer
+
+    # Old trl: SFT-specific kwargs land on the trainer constructor.
+    if not _ARGS_HAVE_SFT_FIELDS:
+        if "max_seq_length" in _sft_params:
+            trainer_kwargs["max_seq_length"] = max_seq_len
+        if "dataset_text_field" in _sft_params:
+            trainer_kwargs["dataset_text_field"] = "text"
 
     trainer = SFTTrainer(**trainer_kwargs)
 

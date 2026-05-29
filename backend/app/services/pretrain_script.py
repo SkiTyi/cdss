@@ -282,36 +282,46 @@ def main():
               "message": f"save_steps={save_steps} 不是 eval_steps={eval_steps} 的整数倍，已自动调整为 {new_save}"})
         save_steps = new_save
 
-    training_args = TrainingArguments(
-        output_dir=output_dir,
-        num_train_epochs=num_epochs,
-        per_device_train_batch_size=batch_size,
-        per_device_eval_batch_size=batch_size,
-        gradient_accumulation_steps=grad_accum,
-        learning_rate=lr,
-        weight_decay=weight_decay,
-        warmup_ratio=warmup_ratio,
-        fp16=fp16,
-        bf16=use_bf16,
-        logging_steps=logging_steps,
-        eval_strategy="steps" if eval_ds else "no",
-        eval_steps=eval_steps if eval_ds else None,
-        save_strategy="steps",
-        save_steps=save_steps,
-        save_total_limit=3,
-        load_best_model_at_end=eval_ds is not None,
-        report_to="none",
-        gradient_checkpointing=True,    # save memory for long blocks
-        # ── eval-time memory hygiene ─────────────────────────────────────
-        # CPT only needs eval_loss / perplexity; we DON'T want Trainer to
-        # accumulate (B, seq_len, vocab) logits across eval batches in fp32
-        # (that's how we hit 18+ GB OOM during evaluate() on a 7B model with
-        # vocab=152K and block_size=4096). prediction_loss_only stops Trainer
-        # from caching logits per batch; eval_do_concat_batches=False stops
-        # it from stitching them all together at the end.
-        prediction_loss_only=True,
-        eval_do_concat_batches=False,
-    )
+    # Build TrainingArguments through inspect — kwarg names drift across
+    # transformers versions (eval_strategy renamed from evaluation_strategy
+    # in 4.39; eval_do_concat_batches added in 4.40). V100 hosts often pin
+    # to ~4.46 for vllm 0.6.2 compat, so this script must run on both.
+    import inspect as _inspect
+    _ta_params = _inspect.signature(TrainingArguments.__init__).parameters
+
+    raw = {
+        "output_dir": output_dir,
+        "num_train_epochs": num_epochs,
+        "per_device_train_batch_size": batch_size,
+        "per_device_eval_batch_size": batch_size,
+        "gradient_accumulation_steps": grad_accum,
+        "learning_rate": lr,
+        "weight_decay": weight_decay,
+        "warmup_ratio": warmup_ratio,
+        "fp16": fp16,
+        "bf16": use_bf16,
+        "logging_steps": logging_steps,
+        "save_strategy": "steps",
+        "save_steps": save_steps,
+        "save_total_limit": 3,
+        "load_best_model_at_end": eval_ds is not None,
+        "report_to": "none",
+        "gradient_checkpointing": True,    # save memory for long blocks
+        # CPT only needs eval_loss / perplexity; without prediction_loss_only
+        # Trainer caches (B, seq_len, vocab) fp32 logits across eval batches
+        # → 18+ GB OOM on a 7B + vocab 152K + block 4096 setup.
+        "prediction_loss_only": True,
+    }
+    if "eval_strategy" in _ta_params:
+        raw["eval_strategy"] = "steps" if eval_ds else "no"
+    elif "evaluation_strategy" in _ta_params:
+        raw["evaluation_strategy"] = "steps" if eval_ds else "no"
+    if eval_ds is not None:
+        raw["eval_steps"] = eval_steps
+    if "eval_do_concat_batches" in _ta_params:
+        raw["eval_do_concat_batches"] = False
+
+    training_args = TrainingArguments(**{k: v for k, v in raw.items() if k in _ta_params})
 
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 

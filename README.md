@@ -157,6 +157,26 @@ npm run dev                                  # 默认 5173
 
 混型 GPU 主机（如 V100-DGXS + V100-PCIE 共存）已在 `_subprocess_env.py` 默认设置 `CUDA_DEVICE_ORDER=PCI_BUS_ID`，确保 `CUDA_VISIBLE_DEVICES=N` 选中的卡与 `nvidia-smi` 显示一致。
 
+### Python 依赖版本矩阵（重要）
+
+vllm / transformers / trl 三者之间有强耦合的版本约束。下表为已验证可用的组合：
+
+| 场景 | vllm | transformers | trl | torch | 说明 |
+|---|---|---|---|---|---|
+| **5090 / A100 / H100** | latest (>= 0.7) | >= 5.0 | latest (>= 0.12, 带 SFTConfig) | cu124+ | 默认安装即可 |
+| **V100 / T4 / Volta** | **0.6.2** (固定) | **4.46.x** (vllm 0.6.2 上限是 4.47) | **0.11.x** (与 transformers 4.46 配对) | cu118 / cu121 | 三个版本必须配对 |
+
+V100 上典型踩坑链：
+- 默认 `pip install trl` 装的是 latest，会带入 `is_trackio_available` 等新符号 → import 失败
+- 看到失败后升级 transformers → vllm 0.6.2 立刻崩
+- 正确做法是固定版本：
+  ```bash
+  pip install "vllm==0.6.2" "transformers==4.46.3" "trl==0.11.4" "peft>=0.13"
+  ```
+  之后任何 `pip install -U xxx` 都不要再碰这三个。
+
+训练脚本（`train_script.py` / `pretrain_script.py`）已经通过 `inspect.signature` 在运行时探测可用的字段，所以代码本身能跨 transformers 4.46 / 5.x 与 trl 0.11 / 0.12+ 跑通——不需要为不同服务器维护两份代码。但**依赖版本本身仍要装对**，否则 trl import 阶段就崩了，根本走不到我们能兼容的层。
+
 ### 多卡 vllm（tensor parallel）
 
 后端检测到 `gpu_ids` 数量 > 1 时自动：
@@ -200,6 +220,8 @@ NCCL_P2P_DISABLE=1
 | 多卡助手日志停在 `Started engine process` 后无任何输出 | 多进程死锁；确认 `VLLM_WORKER_MULTIPROC_METHOD=spawn` 已生效（本项目自动设），若无效再按上文「多卡 vllm」段试 NCCL_P2P_DISABLE / NCCL_IB_DISABLE |
 | 多卡助手日志停在 `vLLM is using nccl==X.Y.Z` 后无输出 | V100 异构 PCIe 主机的 NCCL P2P 探测死锁；助手「额外环境变量」加 `NCCL_P2P_DISABLE=1` |
 | 停止多卡助手后 `nvidia-smi` 仍有进程占着每卡 ~700MB | 老版本会出现 — 升级到本版后 stop() 已改 killpg 整组终止；若仍有残留，`pkill -9 -f vllm` 兜底 |
+| `cannot import name 'is_trackio_available' from 'transformers'` | trl 版本太新但 transformers 太旧（V100 锁定 4.46.x）；按上文版本矩阵 `pip install "trl==0.11.4"` |
+| 升级 transformers 后 vllm 启动报 `KeyError` / 模块缺失 | vllm 0.6.2 依赖特定 transformers ABI；按版本矩阵回退到 4.46.x，不要追新 |
 | `libnvJitLink.so.13: cannot open shared object file` | 没装匹配版本的 `cuda-toolkit`，或 `_subprocess_env.py` 没发现 conda env；用 `conda install -c nvidia cuda-toolkit=<X>.0` 装上 |
 | CPT eval 阶段 OOM | 已通过 `prediction_loss_only=True` + `eval_do_concat_batches=False` 缓解；如仍 OOM，调小 `block_size`（默认 2048） |
 | 训练 loss 图不显示 | Recharts 要求 `<Line>` 必须直接作为 `<LineChart>` 子节点，不能包 `<>...</>` Fragment |
